@@ -1,0 +1,3686 @@
+---
+title: "eleanor code github"
+output: html_document
+date: "2025-08-19"
+---
+ Eleanor Lehman
+ Edited by Kyra Fine
+ Last updated: August 19, 2025
+
+#1: generate ml datasets
+
+```{r}
+# This code generates two datasets: the 'raw' ML dataset, and the normalized
+# and standardized ML dataset. These files are saved as .csv files in the 
+# 'data_subsets' folder 
+
+
+library(tidyverse)
+library(e1071)
+library(mice)
+
+if (!dir.exists("data_subsets")) {
+  dir.create("data_subsets")
+}
+
+data <- read_csv('diff_study_2024-09-23_edited_10-22_fixed.csv')
+
+machine_learning_data <- data %>%
+  # filter dataset to only patients with IBD
+  filter(subtype %in% c('CD','UC','IBD-U')) %>%
+  
+  # remove variables not needed for ML
+  select(-imagine_sample_w_in_3_mo,-matching_id, -Date) %>%
+  
+  # make sure pgas category is only mild
+  filter(pgas %in% c('mild', 'mod', 'severe', 'rem')) %>%
+  
+  # make sure active category is only yes/no
+  filter(active %in% c('y','n')) %>%
+  
+  # encode categorical variable sex with one-hot encoding
+  mutate(value = 1) %>%  
+  pivot_wider(names_from = sex, values_from = value, values_fill = 0) %>%
+  
+  # encode categorical variable medication with one-hot encoding
+  mutate(value = 1) %>%
+  pivot_wider(names_from = med, values_from = value, values_fill = 0) 
+
+# Remove medications that are not used by at least 4 patients
+# ---------------------------------------------------------------------------------
+med_counts <- machine_learning_data %>%
+  group_by(study_id) %>%
+  summarise(across(19:35, sum))
+
+med_counts
+
+# count how many patients used each medication at least once
+med_usage_counts <- med_counts %>%
+  summarise(across(-study_id, ~ sum(. >= 1))) 
+
+# get medications used by less than 4 patients
+meds_to_remove <- med_usage_counts %>%
+  select(where(~ . < 4)) %>%
+  names()
+meds_to_remove
+
+machine_learning_data <- machine_learning_data %>%
+  select(-all_of(meds_to_remove)) %>%
+  select(-NONE)
+
+write_csv(x = machine_learning_data, file = 'data_subsets/ml_data_IBD_with_hb.csv')
+
+machine_learning_data <- machine_learning_data %>%
+  select(-hb)
+
+write_csv(x = machine_learning_data, file = 'data_subsets/ml_data_IBD_with_age.csv')
+
+machine_learning_data <- machine_learning_data %>%
+  select(-age)
+
+write_csv(x = machine_learning_data, file = 'data_subsets/ml_data_IBD.csv')
+
+# Make the normalized & standardized datasets
+# ---------------------------------------------------------------------------------
+norm_stand_data <- machine_learning_data
+
+# find percent missingness in each column
+for (col in colnames(norm_stand_data)) {
+  cat('Column:', col, '\t\tMissing (%):', mean(is.na(norm_stand_data[[col]])) * 100, '\n')
+}
+
+# remove variables where missing is greater than 35%
+norm_stand_data <- norm_stand_data %>%
+  select(-fcal, -esr, -alb)
+
+# MICE imputing
+imputed_data <- mice(norm_stand_data, m = 5, method = "pmm", seed = 123)
+norm_stand_data <- complete(imputed_data, 1)
+
+# test for skewness in data for all non-binary predictors
+## skew < 0 means left skew
+## skew > 0 means right skew
+## skew ~ 0 means centered
+skew_values <- sapply(norm_stand_data[c(4:8,10:12)], function(x) if(is.numeric(x)) skewness(x, na.rm = TRUE) else NA)
+skew_values
+
+left_skew <- list()
+right_skew <- list()
+no_skew <- list()
+
+# find out if the distribution of each variable is left, right or un-skewed
+for (test_name in names(skew_values)){
+  test_value <- skew_values[test_name]
+  
+  if (is.na(test_value)) {
+    next  
+  }
+  
+  if (test_value > 0.5){
+    right_skew <- append(right_skew, c(test_name))
+  }
+  
+  else if (test_value < -0.5){
+    left_skew <- append(left_skew, c(test_name))
+  }
+  
+  else{
+    no_skew <- append(no_skew, c(test_name))
+  }
+}
+
+# print out which variables fall in which skew category
+cat("Right Skew: ", unlist(right_skew), "\n", sep = " ")
+cat("Left Skew: ", unlist(left_skew), "\n", sep = " ")
+cat("Negligible Skew: ", unlist(no_skew), "\n", sep = " ")
+
+# log-transform right skewed variables
+for (col_name in right_skew) {
+  norm_stand_data[[col_name]] <- log10(norm_stand_data[[col_name]]+0.1)
+}
+
+# square transform all left-skewed variables
+for (col_name in left_skew) {
+  norm_stand_data[[col_name]] <- norm_stand_data[[col_name]]^2
+}
+
+# normalize all numeric variables 
+norm_stand_data <- norm_stand_data %>%
+  mutate(across(c(4:8,10:12), ~ scale(.x) %>% as.vector()))
+
+# check class type 
+sapply(norm_stand_data, class)
+
+# write to .csv file
+write_csv(x = norm_stand_data, file = 'data_subsets/norm_stand_ml_IBD.csv')
+```
+
+#2: PCA
+
+```{r}
+# This codes performs PCA with the normalized and standardized ML data
+
+
+library(tidyverse)
+library(tidymodels)
+library(tidytext)
+
+
+if (!dir.exists("plots")) {
+  dir.create("plots")
+}
+
+if (!dir.exists("plots/PCA")) {
+  dir.create("plots/PCA")
+}
+
+data <- read_csv('data_subsets/norm_stand_ml_IBD.csv') %>%
+  select(-study_id)
+
+# CHANGE NAMES FOR GRAPHING!
+rename_labels <- c(Neut = 'Neutrophils',
+                   plt = "Platelets", hct = "Hematocrit", Mono = "Monocytes", 
+                   IFX = "Infliximab", Lymph = "Lymphocytes", Eosin = 'Eosinophils', 
+                   AZA = "Azathioprine", crp = "C-reactive protein", Baso = "Basophils",
+                   PRED = "Prednisone", male = 'Male', female = 'Female', ADL = 'Adalimumab',
+                    ASA = 'Acetylsalicylic acid', MTX = 'Methotrexate',
+                    BUD = "Budesonide", USTE = 'Ustekinumab', 
+                    VEDO = "Vedolizumab", subtype = "Subtype", active = "Active", pgas = "PGAS")
+
+data_renamed <- data %>%
+  rename_with(~ rename_labels[.x], .cols = everything())
+
+pca_rec <- recipe(~., data = data_renamed) %>%
+  update_role(Subtype, PGAS, Active, new_role = "id") %>%  
+  step_impute_mean(all_numeric_predictors()) %>%  
+  step_pca(all_numeric_predictors())
+
+pca_prep <- prep(pca_rec)
+
+tidied_pca <- tidy(pca_prep, 2)
+
+pca_results <- summary(pca_prep$steps[[2]]$res)
+proportion_of_variance <- pca_results$importance["Proportion of Variance",]
+percentage_variance <- format(proportion_of_variance * 100)
+
+tidied_pca <- tidied_pca %>%
+  mutate(component_label = paste0(component, " (", percentage_variance[component], "%)"))
+
+# ------------------------------------------------------------------------------
+first_five_pc_plot <- tidied_pca %>%
+  filter(component %in% paste0("PC", 1:5)) %>%
+  mutate(component = fct_inorder(component)) %>%
+  ggplot(aes(value, terms, fill = terms)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~component_label, nrow = 1) +
+  labs(y = NULL) +
+  theme_minimal()
+
+ggsave('plots/PCA/top_5_pcs.png', plot = first_five_pc_plot, height = 5, width = 7)
+
+pc_top_contributors_plot <- tidied_pca %>%
+  filter(component %in% paste0("PC", 1:4)) %>%
+  group_by(component) %>%
+  top_n(8, abs(value)) %>%
+  ungroup() %>%
+  mutate(terms = reorder_within(terms, abs(value), component)) %>%
+  ggplot(aes(abs(value), terms, fill = value > 0)) +
+  geom_col() +
+  facet_wrap(~component, scales = "free_y") +
+  scale_y_reordered() +
+  scale_fill_manual(
+    values = c("FALSE" = "#13d4d4", "TRUE" = "#ff746c"),  
+    labels = c("FALSE" = "Negative", "TRUE" = "Positive"),  
+    name = "Sign"  
+  ) +
+  labs(
+    x = "Absolute value of contribution",
+    y = NULL
+  )
+
+ggsave('plots/PCA/top_pc_contributors.png', plot = pc_top_contributors_plot)
+
+# PCA scatterplot for subtype
+# ------------------------------------------------------------------------------
+sample_counts <- juice(pca_prep) %>%
+  count(Subtype) %>%
+  mutate(label = paste(Subtype, " (n = ", n, ")", sep = ""))
+
+pca_scat_plot_subtype <- juice(pca_prep) %>%
+  ggplot(aes(PC1, PC2, label = Subtype)) +
+  geom_point(aes(color = Subtype), alpha = 0.7, size = 2) +
+  scale_color_discrete(labels = sample_counts$label) +
+  stat_ellipse(aes(color = Subtype, fill = Subtype), 
+               level = 0.95, size = 0.5, geom = "polygon", alpha = 0.2, show.legend = FALSE) +
+  labs(color = NULL, fill = NULL) +
+  theme_minimal() 
+
+ggsave("plots/PCA/pca_scatterplot_subtype.png", plot = pca_scat_plot_subtype, width = 7, height = 5)
+
+# PCA scatterplot for active
+# ------------------------------------------------------------------------------
+sample_counts <- juice(pca_prep) %>%
+  count(Active) %>%
+  mutate(label = paste(Active, " (n = ", n, ")", sep = ""))
+
+custom_labels <- c(
+  "y" = paste("Active (n = ", sample_counts$n[sample_counts$Active == "y"], ")", sep = ""),
+  "n" = paste("Remission (n = ", sample_counts$n[sample_counts$Active == "n"], ")", sep = "")
+)
+
+pca_plot <- juice(pca_prep) %>%
+  ggplot(aes(PC1, PC2, label = Active)) +
+  geom_point(aes(color = Active), alpha = 0.7, size = 2) +
+  scale_color_discrete(labels = custom_labels) +   
+  stat_ellipse(aes(color = Active, fill = Active), 
+               level = 0.95, size = 0.5, geom = "polygon", alpha = 0.2, show.legend = FALSE) +
+  labs(color = NULL, fill = NULL) +
+  theme_minimal()
+
+ggsave("plots/PCA/pca_scatterplot_active.png", plot = pca_plot, width = 7, height = 5)
+
+# PCA scatterplot for pgas
+# ------------------------------------------------------------------------------
+sample_counts <- juice(pca_prep) %>%
+  count(PGAS) %>%
+  mutate(label = paste(PGAS, " (n = ", n, ")", sep = ""))
+
+custom_labels <- c(
+  "mild" = paste("Mild (n = ", sample_counts$n[sample_counts$PGAS == "mild"], ")", sep = ""),
+  "mod" = paste("Moderate (n = ", sample_counts$n[sample_counts$PGAS == "mod"], ")", sep = ""),
+  "severe" = paste("Severe (n = ", sample_counts$n[sample_counts$PGAS == "severe"], ")", sep = ""),
+  "rem" = paste("Remission (n = ", sample_counts$n[sample_counts$PGAS == "rem"], ")", sep = "")
+)
+
+pca_plot <- juice(pca_prep) %>%
+  mutate(PGAS = factor(PGAS, levels = c("rem", "mild", "mod", "severe"))) %>%
+  ggplot(aes(PC1, PC2, label = PGAS)) +
+  geom_point(aes(color = PGAS), alpha = 0.7, size = 2) +
+  scale_color_discrete(labels = custom_labels) +   
+  stat_ellipse(aes(color = PGAS, fill = PGAS), 
+               level = 0.95, size = 0.5, geom = "polygon", alpha = 0.2, show.legend = FALSE) +
+  labs(color = NULL, fill = NULL) +
+  theme_minimal()
+
+ggsave("plots/PCA/pca_scatterplot_pgas.png", plot = pca_plot, width = 7, height = 5)
+
+```
+
+#3: summary table
+
+```{r}
+# this code generates a table summarizing the variables of interest for the study
+
+
+library(gtsummary)
+library(tidyverse)
+
+
+if (!dir.exists("plots/summary_table")) {
+  dir.create("plots/summary_table")
+}
+
+data <- read_csv('data_subsets/ml_data_IBD_with_age.csv')
+
+# rename active columns so the variables are better
+data <- data %>%
+  mutate(active = case_when(
+    active == 'y' ~ 'Active',
+    active == 'n' ~ 'Remission',
+    TRUE ~ NA_character_
+  )) %>%
+  
+  # re-order the variables for cleanliness
+  select(age, female, male, subtype, pgas, Neut, Lymph, Mono, Eosin, Baso, hct, 
+         plt, alb, esr, crp, fcal, everything()) %>%
+
+  # remove study ID
+  select(-study_id)
+
+# CHANGE NAMES FOR GRAPHING!
+rename_labels <- c(Neut = 'Neutrophils',
+                   plt = "Platelets", hct = "Hematocrit", Mono = "Monocytes", 
+                   IFX = "Infliximab", Lymph = "Lymphocytes", Eosin = 'Eosinophils', 
+                   AZA = "Azathioprine", crp = "C-reactive protein", Baso = "Basophils",
+                   PRED = "Prednisone", male = 'Male', female = 'Female', 
+                   ADL = 'Adalimumab', alb = 'Albumin', ASA = 'Acetylsalicylic acid', 
+                   MTX = 'Methotrexate', fcal = 'Fecal calprotectin', BUD = "Budesonide", 
+                   USTE = 'Ustekinumab', esr = 'ESR', age = 'Age',
+                   VEDO = "Vedolizumab", active = 'Active', pgas = 'PGAS', subtype = 'Subtype')
+
+data_renamed <- data %>%
+  rename_with(~ rename_labels[.x], .cols = everything()) %>%
+  mutate(PGAS = recode(PGAS, mild = "Mild", mod = 'Moderate', severe = "Severe", 
+                       rem = 'Remission'))
+
+# make the summary table  
+summary_table <- tbl_summary(data_renamed, by = Active, missing_text = "missing", 
+                             statistic = list(all_continuous() ~ "{median} [{min}, {max}]")) %>%
+  
+  # add the total column
+  add_overall() %>%
+  
+  # bold the main variables
+  modify_table_styling(columns = label, rows = row_type == 'label', text_format = "bold") %>%
+  
+  # make the missing row italic
+  modify_table_styling(columns = everything(), rows = label == "missing", text_format = "italic") 
+
+# show table
+summary_table
+
+# split the table into two because it is too long, split after 'hct'
+split_table <- tbl_split(summary_table, Basophils)
+split_table
+
+# save first split
+split_table[[1]] %>%
+  as_gt() %>%
+  gt::gtsave("plots/summary_table/summary_table_split_1.html")
+
+# save second split
+split_table[[2]] %>%
+  as_gt() %>%
+  gt::gtsave("plots/summary_table/summary_table_split_2.html")
+
+```
+
+#4.1: random forest
+
+```{r}
+# This code trains a random forest model to predict IBD active/inactive and 
+# performs cross-validation and hyperparameter tuning
+
+
+library(tidymodels)
+library(tidyverse)
+library(rsample)
+library(ranger)
+library(yardstick)
+library(purrr)
+library(caret)
+
+tidymodels::tidymodels_prefer()
+
+# setwd('~/Documents/MBI/final_pipeline/')
+
+# random_forest() does not require standardization or normalization... 
+rf_data <- read_csv('data_subsets/ml_data_IBD.csv') %>%
+  # convert categorical factors to factor level
+  mutate(active = factor(active, levels = c("y", "n")),  
+         pgas = as.factor(pgas), subtype = as.factor(subtype))
+
+set.seed(212)
+
+#GROUP DATA SPLITTING----------------------------------------------------------------
+# split into 80% training and 20% test data for controls without patients crossing between groups
+
+data_split <- group_initial_split(rf_data, study_id, prop = 0.8)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# TRAIN INITIAL MODEL ----------------------------------------------------------
+# initialize the recipe for the model
+rf_recipe <- recipe (active ~ ., data = train_data) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')
+
+# prep and juice recipe
+rf_prep <- prep(rf_recipe)
+rf_juiced <- juice(rf_prep)
+
+# run model
+rf_model <- rand_forest(mode = 'classification') %>%
+  set_engine('ranger', importance = "permutation")
+
+# make workflow
+rf_workflow <- workflow() %>%
+  add_recipe(rf_recipe) %>%
+  add_model(rf_model)
+
+# fit model
+rf_initial <- rf_workflow %>%
+  fit(data = train_data)
+
+# print out model
+rf_initial
+
+# CROSS-VALIDATION -------------------------------------------------------------
+# define model, recipe and workflow
+rf_model <- rand_forest(mode = 'classification') %>%
+  set_engine('ranger')
+
+rf_recipe <- recipe(active ~ ., data = train_data) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')
+
+rf_workflow <- workflow() %>%
+  add_recipe(rf_recipe) %>%
+  add_model(rf_model)
+
+# perform 10-fold cross-validation
+cv_folds <- group_vfold_cv(train_data, group = study_id, v = 10, balance = 'observations')
+
+rf_cv_results <- rf_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+# print out accuracy, AUC and F1 score
+collect_metrics(rf_cv_results)
+
+# FEATURE SELECTION ------------------------------------------------------------
+# extract feature importances from the model
+rf_feature_model <- extract_fit_engine(rf_initial)
+importance <- rf_feature_model$variable.importance
+
+# convert to dataframe
+importance <- as.data.frame(importance)
+colnames(importance) <- c('Importance') 
+importance$Feature <- rownames(importance)
+importance <- importance[, c("Feature", "Importance")]  
+rownames(importance) <- NULL
+
+# CHANGE NAMES FOR GRAPHING!
+rename_labels <- c(Neut = 'Neutrophils',
+                   plt = "Platelets", hct = "Hematocrit", Mono = "Monocytes", 
+                   IFX = "Infliximab", Lymph = "Lymphocytes", Eosin = 'Eosinophils', 
+                   AZA = "Azathioprine", crp = "C-reactive protein", Baso = "Basophils",
+                   PRED = "Prednisone", male = 'Male', female = 'Female', ADL = 'Adalimumab',
+                   alb = 'Albumin', ASA = 'Acetylsalicylic acid', MTX = 'Methotrexate',
+                   fcal = 'Fecal calprotectin', BUD = "Budesonide", USTE = 'Ustekinumab', 
+                   esr = 'ESR', VEDO = "Vedolizumab")
+
+importance_renamed <- importance %>%
+  mutate(Feature = recode(Feature, !!!rename_labels))
+
+# plot feature importances
+ggplot(importance_renamed, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Feature Importance from Random Forest",
+    x = "Feature",
+    y = "Importance"
+  ) +
+  theme_minimal()
+
+ggsave(plot = last_plot(), width = 8, height = 5, 'plots/rf_feature_imp.png')
+
+# print out names of top features in order
+importance_sorted <- importance %>% 
+  arrange(desc(Importance))
+
+############################## stop here for deciding feature importance 
+
+cat('Top features:', importance_sorted$Feature[1:20])
+
+# reduce dataset to top 17 features
+top_features_train <- train_data %>%
+  select(all_of(importance_sorted$Feature[1:20]), active, subtype, pgas, study_id)
+
+# train new RF model on reduced-feature data
+rf_recipe <- recipe (active ~ ., data = top_features_train) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')
+
+# prep and juice recipe
+rf_prep <- prep(rf_recipe)
+rf_juiced <- juice(rf_prep)
+
+# run model
+rf_model <- rand_forest(mode = 'classification') %>%
+  set_engine('ranger', importance = "permutation")
+
+# make workflow
+rf_workflow <- workflow() %>%
+  add_recipe(rf_recipe) %>%
+  add_model(rf_model)
+
+# fit model
+rf_initial <- rf_workflow %>%
+  fit(data = top_features_train)
+
+# print out model
+rf_initial
+
+# CROSS-VALIDATION -------------------------------------------------------------
+# define model, recipe and workflow
+rf_fs_model <- rand_forest(mode = 'classification') %>%
+  set_engine('ranger')
+
+rf_fs_recipe <- recipe(active ~ ., data = top_features_train) %>%
+  update_role(subtype, pgas, new_role = 'ID')
+
+rf_fs_workflow <- workflow() %>%
+  add_recipe(rf_fs_recipe) %>%
+  add_model(rf_fs_model)
+
+# perform 10-fold cross-validation
+cv_folds <- group_vfold_cv(top_features_train, group = study_id, v = 10, balance = 'observations')
+
+rf_fs_cv_results <- rf_fs_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+# print out accuracy, AUC and F1 score
+collect_metrics(rf_fs_cv_results)
+
+# HYPERPARAMETER TUNING --------------------------------------------------------
+# set up grid
+rf_grid <- expand.grid(
+  mtry = c(2, 3, 4, 5),             
+  trees = c(100, 200, 300, 500),           
+  min_n = c(2, 3, 4, 5)
+)
+
+# define model, recipe and workflow
+rf_tuned_model <- rand_forest(mode = 'classification') %>%
+  set_engine('ranger') %>%
+  set_args(
+    mtry = tune(),
+    trees = tune(),
+    min_n = tune()  )
+
+rf_tuned_recipe <- recipe(active ~ ., data = top_features_train) %>%
+  update_role(subtype, pgas, new_role = 'ID')
+
+rf_tuned_workflow <- workflow() %>%
+  add_recipe(rf_tuned_recipe) %>%
+  add_model(rf_tuned_model)
+
+# perform 10-fold cross-validation for tuning
+cv_folds <- group_vfold_cv(top_features_train, v = 10, group = study_id, balance = "observations")
+
+# tune model
+rf_tuned_results <- rf_tuned_workflow %>%
+  tune_grid(
+    resamples = cv_folds,
+    grid = rf_grid,
+    metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)  
+  )
+
+tuning_results <- collect_metrics(rf_tuned_results)
+
+# select optimal parameters based on F1 score
+best_rf_params <- select_best(rf_tuned_results, metric = "f_meas")
+
+# show best performance for each metric...
+rf_tuned_results %>%
+  collect_metrics() %>%
+  filter(.config == best_rf_params$.config)
+
+# FINAL TUNED MODEL EVALUATION -------------------------------------------------
+# finalize workflow with optimal hyperparameters
+rf_final_workflow <- finalize_workflow(
+  rf_tuned_workflow,
+  best_rf_params
+)
+
+# fit the final model 
+rf_final <- fit(rf_final_workflow, data = train_data)
+
+# define metric set
+rf_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- rf_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(rf_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+rf_test_results <- predictions %>%
+  rf_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+rf_test_results
+```
+
+#4.2: support vector machine
+
+```{r}
+# This code trains an SVM model to differentiate between active and inactive
+# IBD, and finalizes a model using cross-validation and hyperparameter tuning
+
+
+library(tidymodels)
+library(tidyverse)
+library(kernlab)
+library(rsample)
+
+tidymodels::tidymodels_prefer()
+
+
+svm_data <- read_csv('data_subsets/norm_stand_ml_IBD.csv') %>%
+  mutate(active = factor(active, levels = c("y", "n")))
+set.seed(212)
+
+# SPLIT DATA -------------------------------------------------------------------
+# split into 80% training and 20% test data for controls
+data_split <- group_initial_split(svm_data, prop = 0.8, group = study_id)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# INITIAL MODEL ----------------------------------------------------------------
+# initialize the recipe for the model
+svm_recipe <- recipe (active ~ ., data = train_data) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')
+
+# prep and juice recipe
+svm_prep <- prep(svm_recipe)
+svm_juiced <- juice(svm_prep)
+
+# define model
+svm_model <- svm_rbf(mode = "classification") %>% 
+  set_engine("kernlab")
+
+# build workflow
+svm_workflow <- workflow() %>%
+  add_model(svm_model) %>%
+  add_recipe(svm_recipe)
+
+# fit model
+svm_initial <- fit(svm_workflow, data = train_data)
+svm_initial
+
+# CROSS-VALIDATION -------------------------------------------------------------
+# perform 10-fold cross-validation
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+svm_cv_results <- svm_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+# print out accuracy, AUC and F1 score
+collect_metrics(svm_cv_results)
+
+# HYPERPARAMETER TUNING --------------------------------------------------------
+# set up grid
+svm_grid <- expand.grid(
+  cost = c(0.01, 0.1, 1, 10, 100),
+  rbf_sigma = c(0.001, 0.01, 0.1, 1, 10)
+)
+
+# define model, recipe and workflow
+svm_tuned_model <- svm_rbf(mode = 'classification', cost = tune(), rbf_sigma = tune()) %>%
+  set_engine('kernlab') 
+
+svm_tuned_workflow <- workflow() %>%
+  add_recipe(svm_recipe) %>%
+  add_model(svm_tuned_model)
+
+# perform 10-fold cross-validation for tuning
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+# tune model
+svm_tuned_results <- svm_tuned_workflow %>%
+  tune_grid(
+    resamples = cv_folds,
+    grid = svm_grid,
+    metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)  
+  )
+
+tuning_results <- collect_metrics(svm_tuned_results)
+
+# show best performance for f1 score metric...
+best_svm_params <- select_best(svm_tuned_results, metric = "f_meas")
+
+svm_tuned_results %>%
+  collect_metrics() %>%
+  filter(.config == best_svm_params$.config)
+
+# FINAL TUNED MODEL EVALUATION -------------------------------------------------
+# finalize workflow with optimal hyperparameters
+svm_final_workflow <- finalize_workflow(
+  svm_tuned_workflow,
+  best_svm_params
+)
+
+# fit the final model 
+svm_final <- fit(svm_final_workflow, data = train_data)
+
+# define metric set
+svm_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- svm_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(svm_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+svm_test_results <- predictions %>%
+  svm_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+svm_test_results
+```
+
+#4.3: multilayer perceptron
+
+```{r}
+# This code trains an MLP model to differentiate between active and inactive
+# IBD, and finalizes a model using cross-validation and hyperparameter tuning
+library(tidymodels)
+library(tidyverse)
+library(nnet)
+library(rsample)
+
+tidymodels::tidymodels_prefer()
+
+mlp_data <- read_csv('data_subsets/norm_stand_ml_IBD.csv') %>%
+  mutate(active = factor(active, levels = c("y", "n")))
+
+set.seed(212)
+
+# SPLIT DATA -------------------------------------------------------------------
+# split into 80% training and 20% test data for controls
+data_split <- group_initial_split(mlp_data, prop = 0.8, group = study_id)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# INITIAL MODEL ----------------------------------------------------------------
+# initialize the recipe for the model
+mlp_recipe <- recipe (active ~ ., data = train_data) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')
+
+# prep and juice recipe
+mlp_prep <- prep(mlp_recipe)
+mlp_juiced <- juice(mlp_prep)
+
+# define model
+mlp_model <- mlp(mode = "classification") %>%
+  set_engine("nnet")
+
+# build workflow
+mlp_workflow <- workflow() %>%
+  add_model(mlp_model) %>%
+  add_recipe(mlp_recipe)
+
+# fit model
+mlp_initial <- fit(mlp_workflow, data = train_data)
+mlp_initial
+
+# CROSS-VALIDATION -------------------------------------------------------------
+# perform 10-fold cross-validation
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+mlp_cv_results <- mlp_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+# print out accuracy, AUC and F1 score
+collect_metrics(mlp_cv_results)
+
+# HYPERPARAMETER TUNING --------------------------------------------------------
+# set up grid
+mlp_grid <- expand.grid(
+  hidden_units = c(5, 10, 20),       
+  penalty = c(0.001, 0.01, 0.1, 1),
+  epochs = c(100, 200, 500)
+)
+
+# define model
+mlp_tuned_model <- mlp(mode = "classification") %>%
+  set_engine("nnet") %>%
+  set_args(
+    hidden_units = tune(),
+    penalty = tune(),
+    epochs = tune()
+  )
+
+# build workflow
+mlp_tuned_workflow <- workflow() %>%
+  add_model(mlp_tuned_model) %>%
+  add_recipe(mlp_recipe)
+
+# perform 10-fold cross-validation for tuning
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+# tune model
+mlp_tuned_results <- mlp_tuned_workflow %>%
+  tune_grid(
+    resamples = cv_folds,
+    grid = mlp_grid,
+    metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)  
+  )
+
+tuning_results <- collect_metrics(mlp_tuned_results)
+
+# show best performance for f1 score metric...
+best_mlp_params <- select_best(mlp_tuned_results, metric = "f_meas")
+
+mlp_tuned_results %>%
+  collect_metrics() %>%
+  filter(.config == best_mlp_params$.config)
+
+# FINAL TUNED MODEL EVALUATION -------------------------------------------------
+# finalize workflow with optimal hyperparameters
+mlp_final_workflow <- finalize_workflow(
+  mlp_tuned_workflow,
+  best_mlp_params
+)
+
+# fit the final model 
+mlp_final <- fit(mlp_final_workflow, data = train_data)
+
+# define metric set
+mlp_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- mlp_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(mlp_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+mlp_test_results <- predictions %>%
+  mlp_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+mlp_test_results
+
+```
+
+#4.4: xgboost
+
+```{r}
+# This code trains, cross-validates and tunes an XGBoost model for the prediction
+# of active and inactive disease in IBD patients
+
+library(xgboost)
+library(tidymodels)
+library(tidyverse)
+library(SHAPforxgboost)
+
+tidymodels::tidymodels_prefer()
+
+xgb_data <- read_csv('data_subsets/ml_data_IBD.csv') %>%
+  # convert categorical factors to factor level
+  mutate(active = factor(active, levels = c("y", "n")),  
+         pgas = as.factor(pgas), subtype = as.factor(subtype))
+set.seed(212)
+
+# SPLIT DATA -------------------------------------------------------------------
+# split into 80% training and 20% test data for controls
+data_split <- group_initial_split(xgb_data, prop = 0.8, group = study_id)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+xgb_model <- boost_tree(engine = 'xgboost') %>%
+  set_mode("classification")
+
+xgb_recipe <- recipe(active ~ ., data = train_data) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')  
+
+xgb_workflow <- workflow() %>%
+  add_model(xgb_model) %>%
+  add_recipe(xgb_recipe)
+
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+xgb_cv_results <- xgb_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+# print out accuracy, AUC and F1 score
+collect_metrics(xgb_cv_results)
+
+xgb_tuned_model <- boost_tree(engine = 'xgboost') %>%
+  set_mode("classification") %>%
+  set_args(tree_depth = tune(),
+    learn_rate = tune(),
+    min_n = tune(),
+    mtry = tune(),
+    loss_reduction = tune())
+
+# perform 10-fold cross-validation for tuning
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+xgb_tuned_workflow <- workflow() %>%
+  add_model(xgb_tuned_model) %>%
+  add_recipe(xgb_recipe)
+
+xgb_grid <- expand.grid(
+  tree_depth = c(3, 5, 7),         
+  learn_rate = c(0.01, 0.1, 0.3),  
+  loss_reduction = c(0, 1, 10),    
+  min_n = c(5, 10, 20), 
+  mtry = c(3, 5, 7))
+
+xgb_tune_results <- tune_grid(xgb_tuned_workflow, resamples = cv_folds, grid = xgb_grid,
+  metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens))
+
+tuning_results <- collect_metrics(xgb_tune_results)
+
+# select optimal parameters based on F1 score
+best_xgb_params <- select_best(xgb_tune_results, metric = "f_meas")
+
+# show best performance for each metric...
+xgb_tune_results %>%
+  collect_metrics() %>%
+  filter(.config == best_xgb_params$.config)
+
+# SET FINAL MODEL --------------------------------------------------------------
+# finalize workflow with optimal hyperparameters
+xgb_final_workflow <- finalize_workflow(
+  xgb_tuned_workflow,
+  best_xgb_params
+)
+
+# fit the final model 
+xgb_final <- fit(xgb_final_workflow, data = train_data)
+
+# define metric set
+xgb_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- xgb_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(xgb_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+xgb_test_results <- predictions %>%
+  xgb_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+xgb_test_results
+
+# make a confusion matrix
+#confusion_matrix <- predictions %>%     
+#  conf_mat(truth = active, estimate = .pred_class)
+
+#print(confusion_matrix)
+
+# SHAP analysis ----------------------------------------------------------------
+# extract final model
+xgb_model <- extract_fit_engine(xgb_final)
+
+# convert training data to matrix form
+train_matrix <- train_data %>%
+  select(-active, -pgas, -subtype, -study_id) %>%  
+  as.matrix()
+
+# get shap values
+shap_values <- shap.prep(xgb_model = xgb_model, X_train = train_matrix)
+
+# CHANGE NAMES FOR GRAPHING!
+rename_labels <- c(Neut = 'Neutrophils',
+                   plt = "Platelets", hct = "Hematocrit", Mono = "Monocytes", 
+                   IFX = "Infliximab", Lymph = "Lymphocytes", Eosin = 'Eosinophils', 
+                   AZA = "Azathioprine", crp = "C-reactive protein", Baso = "Basophils",
+                   PRED = "Prednisone", male = 'Male', female = 'Female', ADL = 'Adalimumab',
+                   alb = 'Albumin', ASA = 'Acetylsalicylic acid', MTX = 'Methotrexate',
+                   fcal = 'Fecal calprotectin', BUD = "Budesonide", USTE = 'Ustekinumab', 
+                   esr = 'ESR', VEDO = "Vedolizumab")
+
+shap_values_renamed <- shap_values %>%
+  mutate(variable = recode(variable, !!!rename_labels))
+
+# make summary plot
+shap.plot.summary(shap_values_renamed)
+
+ggsave(plot = last_plot(), 'plots/xgb_SHAP.png', width = 8, height = 5)
+
+# ROC-AUC curve ----------------------------------------------------------------
+roc_data <- roc_curve(predictions, truth = active, .pred_y)
+
+# plot curve
+roc_plot <- ggplot(roc_data, aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(color = "darkblue", linewidth = 1) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  coord_equal() +
+  labs(
+    title = "ROC Curve for XGBoost Model",
+    x = "1 - Specificity (False Positive Rate)",
+    y = "Sensitivity (True Positive Rate)"
+  ) +
+  theme_minimal()
+
+ggsave(plot = roc_plot, file = 'plots/ROC_XGB.png')
+
+# Confusion matrix -------------------------------------------------------------
+# re-code the predictions y and n as full words for graph legibility
+predictions <- predictions %>%
+  mutate(active = recode(active, y = "Active", n = "Remission"),
+    .pred_class = recode(.pred_class, y = "Active", n = "Remission"))
+
+# create the confusion matrix
+conf_mat_obj <- conf_mat(predictions, truth = active, estimate = .pred_class)
+
+# plot matrix
+confusion_plot <- autoplot(conf_mat_obj, type = "heatmap") +
+  scale_fill_gradient(low = "lightblue", high = "navy", limits = c(20, 220))+
+  labs(title = "Confusion Matrix XGBoost", x = "Predicted", y = "Actual") +
+  theme_minimal()
+
+confusion_plot
+
+ggsave(plot = confusion_plot, file = 'plots/confusion_mat_XGB.png')
+
+
+```
+
+#5: hb vs hct plot
+
+```{r}
+# This code generates a scatterplot of hemoglobin vs hematocrit 
+
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+
+
+hb_data <- read_csv('data_subsets/ml_data_IBD_with_hb.csv')
+
+plot <- ggplot(hb_data, aes(x=hb, y=hct)) +
+  geom_point() + 
+  theme_minimal() +
+  xlab("Hemoglobin (g/L)") +
+  ylab("Hematocrit") +
+  stat_cor(method = "spearman", label.x = 50, label.y = 0.5)
+
+plot
+
+ggsave('plots/hb_vs_hct.png', plot, width = 7, height = 5)
+```
+
+#6: patient specific visualization
+
+```{r}
+# This code will take patients with repeat bloodwork measures, and graph the 
+# changes in each bloodwork value over time. 
+
+library(tidyverse)
+
+if (!dir.exists("plots/patient_specific")) {
+  dir.create("plots/patient_specific")
+}
+
+# filter dataset so only IBD patients in active/remission are included
+pat_spec_data <- read_csv('diff_study_2024-09-23_edited_10-22_fixed.csv') %>%
+  filter(active %in% c('y','n')) %>%
+  select(-imagine_sample_w_in_3_mo, -matching_id) %>%
+  mutate(active = as.factor(active)) %>%
+  ungroup()
+
+# see how many repeat values each patient has
+unique_patients <- unique(pat_spec_data$study_id)
+lab_count <- c()
+
+for (patient in unique_patients){
+  patient_data <- pat_spec_data[pat_spec_data$study_id == patient, ]
+  
+  # count occurrences for each active status
+  y_count <- sum(patient_data$active == 'y')
+  n_count <- sum(patient_data$active == 'n')
+  count<- sum(pat_spec_data$study_id == patient)
+  
+  # check if both conditions are satisfied
+  if (y_count >= 7 && n_count >= 7) {
+    lab_count[patient] <- list(count)
+  }
+}
+
+print(unlist(lab_count))
+
+# filter dataset to be only the patients with the repeat measures
+repeat_patients <- names(lab_count)
+
+# filter out to only repeat patients, and add another column renaming the patient
+# IDs as integers to preserve patient confidentiality
+pat_spec_data <- pat_spec_data %>% 
+  filter(study_id %in% repeat_patients) %>%
+  mutate(patient_num = as.integer(factor(study_id)))
+
+# save as .csv file for future analysis
+write_csv(pat_spec_data, 'data_subsets/repeat_bloodwork_patients_min_7.csv')
+
+# get the bloodwork metrics that will be tested for differences
+metrics <- names(pat_spec_data)[c(4, 8:12, 15:20)]
+
+# TAKE THIS OUT FOR GRAPHING ALL PATIENT METRICS
+# the naming is not properly fixed, with units, for default code.
+# would have to follow code below for all variables to fix labels. 
+# ------------------------------------------------------------------------------
+metrics <- c("Hemoglobin (g/L)", "Lymphocytes (x10^9 cells/L)")
+repeat_patients <- c('100317', '100301')
+# ------------------------------------------------------------------------------
+
+GraphMetricOverTime <- function(pat_spec_data, repeat_patients, metrics){
+  for (patient in repeat_patients){
+    patient_data <- pat_spec_data %>%
+      filter(study_id == patient) %>%
+      rename("Hemoglobin (g/L)" = hb, "Lymphocytes (x10^9 cells/L)" = Lymph)
+    
+    patient_num <- patient_data %>%
+      pull(patient_num) %>%
+      unique()
+    
+    for (metric in metrics){
+      ggplot(patient_data, aes(x = Date, y = !!rlang::sym(metric), color = active)) +
+        geom_path(color = "grey", size = 1, na.rm = TRUE) +
+        geom_point(aes(color = active), size = 3, na.rm = TRUE) +  
+        labs(
+          title = paste("Patient:", patient_num, "-", metric),
+          x = "Time",
+          y = metric,
+          color = "Activity Status"
+        ) +
+        scale_color_manual(
+          values = c("n" = "blue", "y" = "red"),
+          labels = c("Remission", "Active")
+        ) +
+        theme_minimal()
+      
+      metric_no_units <- sub(" .*", "", metric)
+      
+      ggsave(paste0("plots/patient_specific/", patient, "/", metric_no_units, ".png"), create.dir = TRUE, width = 7, height = 5)
+    }
+    
+    print(paste('Patient', patient, 'done.'))
+    
+    }
+  }
+
+GraphMetricOverTime(pat_spec_data, repeat_patients, metrics)
+
+```
+
+#7: patient specific t-test
+
+```{r}
+# This code will take patients with repeat bloodwork measures, and calculate the 
+# mean of each bloodwork value in both active disease and remission, then 
+# conducting a t-test to see which differences are significant
+
+library(tidyverse)
+
+if (!dir.exists("stats_results")) {
+  dir.create("stats_results")
+}
+
+rep_patient_data <- read_csv('data_subsets/repeat_bloodwork_patients_min_7.csv')
+
+repeat_patients <- unique(rep_patient_data$study_id)
+metrics <- names(rep_patient_data)[c(4, 8:12, 15:20)]
+
+results <- tibble(patient = character(), patient_num = numeric(), metric = character(), 
+                  mean_y = numeric(), mean_n = numeric(), 
+                  p_value = numeric(), t_statistic = numeric(), 
+                  df = numeric(), message = character())
+
+TestMetricMeanDiff <- function(rep_patient_data, repeat_patients, metrics){
+  for (patient in repeat_patients){
+    print(patient)
+    patient_data <- rep_patient_data %>%
+      filter(study_id == patient)
+    
+    patient_num <- patient_data %>%
+      pull(patient_num) %>%
+      unique()
+    
+    for (metric in metrics){
+      group_means_and_counts <- patient_data %>%
+        group_by(active) %>%
+        summarize(
+          mean = mean(!!rlang::sym(metric), na.rm = TRUE),
+          count = sum(!is.na(!!rlang::sym(metric)))
+        )
+      
+      cat(paste0(metric,' in Active and Remission Patients \n'))
+      print(group_means_and_counts)
+      cat('\n')
+      
+      # check both active and remission groups have at least 2 non-missing values
+      if (all(group_means_and_counts$count >= 2)) {
+        t_test_result <- t.test(patient_data[[metric]] ~ patient_data$active)
+        cat('T-test performed. \n\n')
+        
+        results <- results %>%
+          add_row(
+            patient = patient,
+            patient_num = patient_num,
+            metric = metric,
+            mean_y = group_means_and_counts$mean[group_means_and_counts$active == 'y'],
+            mean_n = group_means_and_counts$mean[group_means_and_counts$active == 'n'],
+            p_value = t_test_result$p.value,
+            t_statistic = t_test_result$statistic,
+            df = t_test_result$parameter,
+            message = "T-test performed"
+          )
+        
+      } else {
+        cat('Insufficient data to perform T-test. \n\n')
+        
+        results <- results %>%
+          add_row(
+            patient = patient,
+            patient_num = patient_num,
+            metric = metric,
+            mean_y = group_means_and_counts$mean[group_means_and_counts$active == 'y'],
+            mean_n = group_means_and_counts$mean[group_means_and_counts$active == 'n'],
+            p_value = NA,
+            t_statistic = NA,
+            df = NA,
+            message = "Insufficient data to perform T-test"
+          )
+      }
+
+    }
+  }
+  return(results)
+}
+
+results <- TestMetricMeanDiff(rep_patient_data, repeat_patients, metrics)
+
+write_csv(results, 'stats_results/t_test_results_7.csv')
+
+filtered_results <- results %>%
+  filter(message == 'T-test performed')
+
+# save to .csv file for excel
+write_csv(filtered_results, 'stats_results/t_test_results_filtered_7.csv')
+
+```
+
+#8: WBC diff vs meds
+
+```{r}
+# This code performs a MANOVA to test whether medications affect the white blood 
+# cell differential of patients
+
+library(tidyverse)
+
+WBC_data <- read_csv('data_subsets/norm_stand_ml_IBD.csv')
+
+# remove unwanted columns
+WBC_data <- WBC_data %>%
+  select(-subtype, -active, -pgas, -hct, -plt, -crp, -female, -male)
+
+# get names for loop
+medications <- names(WBC_data[7:15])
+wbc_subtypes <- names(WBC_data[1:5])
+
+# empty df to store results
+manova_results <- data.frame()
+
+overall_manova_results <- data.frame()
+
+# loop through each medication
+for (medication in medications) {
+  
+  # MANOVA for each medication with entire differential
+  formula <- as.formula(paste("cbind(", paste(wbc_subtypes, collapse = ", "), ") ~", medication))
+
+  # run multi-ANOVA
+  manova_model <- manova(formula, data = WBC_data)
+  
+  manova_summary <- summary.aov(manova_model)
+  
+  overall_manova_summary <- as.data.frame(summary(manova_model)[4])
+  overall_manova_results<- rbind(overall_manova_results, overall_manova_summary)
+  
+  for (i in 1:length(manova_summary)) {
+    temp_df <- as.data.frame(manova_summary[[i]])
+    
+    temp_df$medication <- medication
+    
+    # Add the response variable name (corresponding to the WBC subtype)
+    temp_df$response_variable <- names(manova_summary)[i]
+    
+    # Optionally, you can add the p-value and F-statistic
+    temp_df$p_value <- temp_df$`Pr(>F)`
+    temp_df$f_statistic <- temp_df$`F value`
+    
+    # Append to the main results data frame
+    manova_results <- rbind(manova_results, temp_df)
+  }
+  
+}
+
+# get only the useful rows from the manova table
+manova_useful <- manova_results[seq(1, nrow(manova_results), by = 2), ]
+
+# rename the response variable to a more legible format
+manova_useful$response_variable <- sapply(strsplit(manova_useful$response_variable, " "), `[`, 3)
+
+# save results for all individual WBCs
+write.csv(manova_useful, 'stats_results/manova_results.csv', row.names = FALSE)
+
+# save results for initial, overall MANOVA
+write.csv(overall_manova_results, 'stats_results/manova_results_overall.csv')
+
+
+```
+
+#9.1:  benchmarking against basic statistics: creating standardized dataset without dummy variables
+medication has been removed because it was not used in the machine learning models, in order to facilitate the methods comparison
+```{r}
+
+
+library(tidyverse)
+library(e1071)
+library(mice)
+
+if (!dir.exists("data_subsets")) {
+  dir.create("data_subsets")
+}
+
+data <- read_csv('diff_study_2024-09-23_edited_10-22_fixed.csv')
+
+stats_data <- data %>%
+  # filter dataset to only patients with IBD
+  filter(subtype %in% c('CD','UC','IBD-U')) %>%
+  
+  # remove variables not needed for ML
+  select(-imagine_sample_w_in_3_mo,-matching_id, -Date, -med) %>%
+  
+  # make sure pgas category is only mild
+  filter(pgas %in% c('mild', 'mod', 'severe', 'rem')) %>%
+  
+  # make sure active category is only yes/no
+  filter(active %in% c('y','n'))
+  
+ 
+
+
+
+# Make the normalized & standardized datasets
+# ---------------------------------------------------------------------------------
+norm_stand_data <- stats_data
+
+# find percent missingness in each column
+for (col in colnames(norm_stand_data)) {
+  cat('Column:', col, '\t\tMissing (%):', mean(is.na(norm_stand_data[[col]])) * 100, '\n')
+}
+
+# remove variables where missing is greater than 35%
+norm_stand_data <- norm_stand_data %>%
+  select(-fcal, -esr, -alb)
+
+# MICE imputing
+imputed_data <- mice(norm_stand_data, m = 5, method = "pmm", seed = 123)
+norm_stand_data <- complete(imputed_data, 1)
+
+# test for skewness in data for all non-binary predictors
+## skew < 0 means left skew
+## skew > 0 means right skew
+## skew ~ 0 means centered
+skew_values <- sapply(norm_stand_data[c(6:10,12:15)], function(x) if(is.numeric(x)) skewness(x, na.rm = TRUE) else NA)
+skew_values
+
+left_skew <- list()
+right_skew <- list()
+no_skew <- list()
+
+# find out if the distribution of each variable is left, right or un-skewed
+for (test_name in names(skew_values)){
+  test_value <- skew_values[test_name]
+  
+  if (is.na(test_value)) {
+    next  
+  }
+  
+  if (test_value > 0.5){
+    right_skew <- append(right_skew, c(test_name))
+  }
+  
+  else if (test_value < -0.5){
+    left_skew <- append(left_skew, c(test_name))
+  }
+  
+  else{
+    no_skew <- append(no_skew, c(test_name))
+  }
+}
+
+# print out which variables fall in which skew category
+cat("Right Skew: ", unlist(right_skew), "\n", sep = " ")
+cat("Left Skew: ", unlist(left_skew), "\n", sep = " ")
+cat("Negligible Skew: ", unlist(no_skew), "\n", sep = " ")
+
+# log-transform right skewed variables
+for (col_name in right_skew) {
+  norm_stand_data[[col_name]] <- log10(norm_stand_data[[col_name]]+0.1)
+}
+
+# square transform all left-skewed variables
+for (col_name in left_skew) {
+  norm_stand_data[[col_name]] <- norm_stand_data[[col_name]]^2
+}
+
+# normalize all numeric variables 
+norm_stand_data <- norm_stand_data %>%
+  mutate(across(c(6:10,12:15), ~ scale(.x) %>% as.vector()))
+
+# check class type 
+sapply(norm_stand_data, class)
+
+# write to .csv file
+write_csv(x = norm_stand_data, file = 'data_subsets/norm_stand_stats_IBD.csv')
+```
+
+
+#9.2: logistical regression
+
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(rsample)
+
+tidymodels::tidymodels_prefer()
+
+glm_data <- read_csv('data_subsets/norm_stand_stats_IBD.csv') %>%
+  mutate(active = factor(active, levels = c("y", "n")))
+
+set.seed(212)
+
+# SPLIT DATA -------------------------------------------------------------------
+# split into 80% training and 20% test data for controls
+data_split <- group_initial_split(glm_data, prop = 0.8, group = study_id)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# INITIAL MODEL ----------------------------------------------------------------
+# initialize the recipe for the model
+glm_recipe <- recipe (active ~ ., data = train_data) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')
+
+# prep and juice recipe
+glm_prep <- prep(glm_recipe)
+glm_juiced <- juice(glm_prep)
+
+# define model
+glm_model <- logistic_reg() %>%
+  set_engine("glm")
+
+# build workflow
+glm_workflow <- workflow() %>%
+  add_model(glm_model) %>%
+  add_recipe(glm_recipe)
+
+# fit model
+glm_initial <- fit(glm_workflow, data = train_data)
+glm_initial
+
+# CROSS-VALIDATION -------------------------------------------------------------
+# perform 10-fold cross-validation
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+glm_cv_results <- glm_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+
+
+# show best performance for f1 score metric...
+best_glm_params <- select_best(glm_cv_results, metric = "f_meas")
+
+glm_cv_results %>%
+  collect_metrics() %>%
+  filter(.config == best_glm_params$.config)
+
+# FINAL MODEL EVALUATION -------------------------------------------------
+# finalize workflow
+glm_final_workflow <- finalize_workflow(
+  glm_workflow,
+  best_glm_params
+)
+
+# fit the final model 
+glm_final <- fit(glm_final_workflow, data = train_data)
+
+# define metric set
+glm_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- glm_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(glm_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+glm_test_results <- predictions %>%
+  glm_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+glm_test_results
+```
+
+
+
+#10.1 XGBoost without sex (or age), eliminating a potential sociological rather than biological effect
+```{r}
+library(xgboost)
+library(tidymodels)
+library(tidyverse)
+library(SHAPforxgboost)
+
+tidymodels::tidymodels_prefer()
+
+xgb_data <- read_csv('data_subsets/ml_data_IBD.csv') %>%
+  select(-female, -male) %>%
+  # convert categorical factors to factor level
+  mutate(active = factor(active, levels = c("y", "n")),  
+         pgas = as.factor(pgas), subtype = as.factor(subtype))
+set.seed(212)
+
+# SPLIT DATA -------------------------------------------------------------------
+# split into 80% training and 20% test data for controls
+data_split <- group_initial_split(xgb_data, prop = 0.8, group = study_id)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+xgb_model <- boost_tree(engine = 'xgboost') %>%
+  set_mode("classification")
+
+xgb_recipe <- recipe(active ~ ., data = train_data) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')  
+
+xgb_workflow <- workflow() %>%
+  add_model(xgb_model) %>%
+  add_recipe(xgb_recipe)
+
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+xgb_cv_results <- xgb_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+# print out accuracy, AUC and F1 score
+collect_metrics(xgb_cv_results)
+
+xgb_tuned_model <- boost_tree(engine = 'xgboost') %>%
+  set_mode("classification") %>%
+  set_args(tree_depth = tune(),
+    learn_rate = tune(),
+    min_n = tune(),
+    mtry = tune(),
+    loss_reduction = tune())
+
+# perform 10-fold cross-validation for tuning
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+xgb_tuned_workflow <- workflow() %>%
+  add_model(xgb_tuned_model) %>%
+  add_recipe(xgb_recipe)
+
+xgb_grid <- expand.grid(
+  tree_depth = c(3, 5, 7),         
+  learn_rate = c(0.01, 0.1, 0.3),  
+  loss_reduction = c(0, 1, 10),    
+  min_n = c(5, 10, 20), 
+  mtry = c(3, 5, 7))
+
+xgb_tune_results <- tune_grid(xgb_tuned_workflow, resamples = cv_folds, grid = xgb_grid,
+  metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens))
+
+tuning_results <- collect_metrics(xgb_tune_results)
+
+# select optimal parameters based on F1 score
+best_xgb_params <- select_best(xgb_tune_results, metric = "f_meas")
+
+# show best performance for each metric...
+xgb_tune_results %>%
+  collect_metrics() %>%
+  filter(.config == best_xgb_params$.config)
+
+# SET FINAL MODEL --------------------------------------------------------------
+# finalize workflow with optimal hyperparameters
+xgb_final_workflow <- finalize_workflow(
+  xgb_tuned_workflow,
+  best_xgb_params
+)
+
+# fit the final model 
+xgb_final <- fit(xgb_final_workflow, data = train_data)
+
+# define metric set
+xgb_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- xgb_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(xgb_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+xgb_test_results <- predictions %>%
+  xgb_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+xgb_test_results
+
+# make a confusion matrix
+#confusion_matrix <- predictions %>%     
+#  conf_mat(truth = active, estimate = .pred_class)
+
+#print(confusion_matrix)
+
+# SHAP analysis ----------------------------------------------------------------
+# extract final model
+xgb_model <- extract_fit_engine(xgb_final)
+
+# convert training data to matrix form
+train_matrix <- train_data %>%
+  select(-active, -pgas, -subtype, -study_id) %>%  
+  as.matrix()
+
+# get shap values
+shap_values <- shap.prep(xgb_model = xgb_model, X_train = train_matrix)
+
+# CHANGE NAMES FOR GRAPHING!
+rename_labels <- c(Neut = 'Neutrophils',
+                   plt = "Platelets", hct = "Hematocrit", Mono = "Monocytes", 
+                   IFX = "Infliximab", Lymph = "Lymphocytes", Eosin = 'Eosinophils', 
+                   AZA = "Azathioprine", crp = "C-reactive protein", Baso = "Basophils",
+                   PRED = "Prednisone", male = 'Male', female = 'Female', ADL = 'Adalimumab',
+                   alb = 'Albumin', ASA = 'Acetylsalicylic acid', MTX = 'Methotrexate',
+                   fcal = 'Fecal calprotectin', BUD = "Budesonide", USTE = 'Ustekinumab', 
+                   esr = 'ESR', VEDO = "Vedolizumab")
+
+shap_values_renamed <- shap_values %>%
+  mutate(variable = recode(variable, !!!rename_labels))
+
+# make summary plot
+shap.plot.summary(shap_values_renamed)
+
+ggsave(plot = last_plot(), 'plots/xgb_SHAP.png', width = 8, height = 5)
+
+# ROC-AUC curve ----------------------------------------------------------------
+roc_data <- roc_curve(predictions, truth = active, .pred_y)
+
+# plot curve
+roc_plot <- ggplot(roc_data, aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(color = "darkblue", linewidth = 1) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  coord_equal() +
+  labs(
+    title = "ROC Curve for XGBoost Model",
+    x = "1 - Specificity (False Positive Rate)",
+    y = "Sensitivity (True Positive Rate)"
+  ) +
+  theme_minimal()
+
+ggsave(plot = roc_plot, file = 'plots/ROC_XGB.png')
+
+# Confusion matrix -------------------------------------------------------------
+# re-code the predictions y and n as full words for graph legibility
+predictions <- predictions %>%
+  mutate(active = recode(active, y = "Active", n = "Remission"),
+    .pred_class = recode(.pred_class, y = "Active", n = "Remission"))
+
+# create the confusion matrix
+conf_mat_obj <- conf_mat(predictions, truth = active, estimate = .pred_class)
+
+# plot matrix
+confusion_plot <- autoplot(conf_mat_obj, type = "heatmap") +
+  scale_fill_gradient(low = "lightblue", high = "navy", limits = c(20, 220))+
+  labs(title = "Confusion Matrix XGBoost", x = "Predicted", y = "Actual") +
+  theme_minimal()
+
+confusion_plot
+
+ggsave(plot = confusion_plot, file = 'plots/confusion_mat_XGB.png')
+```
+
+#10.2 logistic regression without sex(or age)
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(rsample)
+
+tidymodels::tidymodels_prefer()
+
+glm_data <- read_csv('data_subsets/norm_stand_stats_IBD.csv') %>%
+  select(-sex, -age) %>%
+  mutate(active = factor(active, levels = c("y", "n")))
+
+set.seed(212)
+
+# SPLIT DATA -------------------------------------------------------------------
+# split into 80% training and 20% test data for controls
+data_split <- group_initial_split(glm_data, prop = 0.8, group = study_id)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# INITIAL MODEL ----------------------------------------------------------------
+# initialize the recipe for the model
+glm_recipe <- recipe (active ~ ., data = train_data) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')
+
+# prep and juice recipe
+glm_prep <- prep(glm_recipe)
+glm_juiced <- juice(glm_prep)
+
+# define model
+glm_model <- logistic_reg() %>%
+  set_engine("glm")
+
+# build workflow
+glm_workflow <- workflow() %>%
+  add_model(glm_model) %>%
+  add_recipe(glm_recipe)
+
+# fit model
+glm_initial <- fit(glm_workflow, data = train_data)
+glm_initial
+
+# CROSS-VALIDATION -------------------------------------------------------------
+# perform 10-fold cross-validation
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+glm_cv_results <- glm_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+
+
+# show best performance for f1 score metric...
+best_glm_params <- select_best(glm_cv_results, metric = "f_meas")
+
+glm_cv_results %>%
+  collect_metrics() %>%
+  filter(.config == best_glm_params$.config)
+
+# FINAL MODEL EVALUATION -------------------------------------------------
+# finalize workflow
+glm_final_workflow <- finalize_workflow(
+  glm_workflow,
+  best_glm_params
+)
+
+# fit the final model 
+glm_final <- fit(glm_final_workflow, data = train_data)
+
+# define metric set
+glm_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- glm_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(glm_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+glm_test_results <- predictions %>%
+  glm_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+glm_test_results
+```
+#11.1 RF smote
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(tidymodels)
+library(ranger)
+library(rsample)
+library(yardstick)
+library(purrr)
+library(parsnip)
+library(themis)
+tidymodels_prefer()
+cores <- parallel::detectCores()
+
+#loading and splitting data
+hyn <- 
+  read_csv("data_subsets/ml_data_IBD.csv") %>%
+ # dplyr::select(active, Neut, Lymph, Mono, Eosin, Baso, hct, plt) |>
+  as_tibble() |>
+  mutate(active = factor(active, levels = c("y", "n"))) |>
+  select(-subtype, -pgas, -alb, -esr, -fcal, -crp) |>
+  drop_na()
+
+
+set.seed(2025)
+hyn_split <- group_initial_split(hyn, study_id, prop = 0.8)
+hyn_train <- training(hyn_split)
+hyn_test  <-  testing(hyn_split)
+
+
+
+#model
+hyn_model  <- 
+  rand_forest(trees = 1000) %>% 
+  set_engine("ranger", num.threads = cores) %>% 
+  set_mode("classification") %>%
+  set_args(
+    mtry = tune(),
+    trees = tune(),
+    min_n = tune()  )
+
+#recipe
+hyn_recipe <- 
+  recipe(active ~ ., data = hyn_train) %>%
+  update_role(study_id, new_role = 'ID') %>%
+  step_smote(active)
+hyn_prep <- prep(hyn_recipe)
+hyn_juiced <- juice(hyn_prep)
+
+
+# generate tuning grid
+
+hyn_grid <- expand.grid(
+  mtry = c(2, 3, 4, 5),             
+  trees = c(100, 200, 300, 500),           
+  min_n = c(2, 3, 4, 5)
+)
+
+#workflow
+hyn_workflow <- 
+  workflow() %>% 
+  add_model(hyn_model) %>%
+  add_recipe(hyn_recipe)
+
+#10-fold cross-validation
+cv_folds <- vfold_cv(hyn_train, v = 10, strata = active)
+
+#tune model
+hyn_tuned <- hyn_workflow %>%
+  tune_grid(
+    resamples = cv_folds,
+    grid = hyn_grid,
+    metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)  
+  )
+
+
+#select optimal parameters based on f1
+hyn_best_rf_params <- select_best(hyn_tuned, metric = "f_meas")
+
+#create finalized workflow with optimized metrics
+hyn_final_workflow <- finalize_workflow(
+  hyn_workflow,
+  hyn_best_rf_params
+)
+
+#fit finalized model
+hyn_final_fit <- fit(hyn_final_workflow, data = hyn_train)
+
+#define final metric set
+hyn_final_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+#evaluate final model on test set
+hyn_final_pred <- hyn_final_fit %>%
+  predict(new_data = hyn_test, type = "prob") %>%
+  bind_cols(hyn_final_fit %>% predict(new_data = hyn_test, type = "class"), hyn_test)
+
+hyn_final_res <- hyn_final_pred %>%
+  hyn_final_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+#display results
+hyn_final_res
+
+# make a confusion matrix
+rf_confusion_matrix <- hyn_final_pred %>%     
+  conf_mat(truth = active, estimate = .pred_class)
+print(rf_confusion_matrix)
+
+#          Truth
+#Prediction   y   n
+#         y 140  39
+#         n  43  65
+```
+
+#11.2 SVM smote
+```{r}
+
+library(tidymodels)
+library(tidyverse)
+library(kernlab)
+library(rsample)
+library(themis)
+tidymodels::tidymodels_prefer()
+
+
+svm_data <- read_csv('data_subsets/norm_stand_ml_IBD.csv') %>%
+  mutate(active = factor(active, levels = c("y", "n")))
+set.seed(212)
+
+# SPLIT DATA -------------------------------------------------------------------
+# split into 80% training and 20% test data for controls
+data_split <- group_initial_split(svm_data, prop = 0.8, group = study_id)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# INITIAL MODEL ----------------------------------------------------------------
+# initialize the recipe for the model
+svm_recipe <- recipe (active ~ ., data = train_data) %>%
+  step_smote(active) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')
+
+# prep and juice recipe
+svm_prep <- prep(svm_recipe)
+svm_juiced <- juice(svm_prep)
+
+# define model
+svm_model <- svm_rbf(mode = "classification") %>% 
+  set_engine("kernlab")
+
+# build workflow
+svm_workflow <- workflow() %>%
+  add_model(svm_model) %>%
+  add_recipe(svm_recipe)
+
+# fit model
+svm_initial <- fit(svm_workflow, data = train_data)
+svm_initial
+
+# CROSS-VALIDATION -------------------------------------------------------------
+# perform 10-fold cross-validation
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+svm_cv_results <- svm_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+# print out accuracy, AUC and F1 score
+collect_metrics(svm_cv_results)
+
+# HYPERPARAMETER TUNING --------------------------------------------------------
+# set up grid
+svm_grid <- expand.grid(
+  cost = c(0.01, 0.1, 1, 10, 100),
+  rbf_sigma = c(0.001, 0.01, 0.1, 1, 10)
+)
+
+# define model, recipe and workflow
+svm_tuned_model <- svm_rbf(mode = 'classification', cost = tune(), rbf_sigma = tune()) %>%
+  set_engine('kernlab') 
+
+svm_tuned_workflow <- workflow() %>%
+  add_recipe(svm_recipe) %>%
+  add_model(svm_tuned_model)
+
+# perform 10-fold cross-validation for tuning
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+# tune model
+svm_tuned_results <- svm_tuned_workflow %>%
+  tune_grid(
+    resamples = cv_folds,
+    grid = svm_grid,
+    metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)  
+  )
+
+tuning_results <- collect_metrics(svm_tuned_results)
+
+# show best performance for f1 score metric...
+best_svm_params <- select_best(svm_tuned_results, metric = "f_meas")
+
+svm_tuned_results %>%
+  collect_metrics() %>%
+  filter(.config == best_svm_params$.config)
+
+# FINAL TUNED MODEL EVALUATION -------------------------------------------------
+# finalize workflow with optimal hyperparameters
+svm_final_workflow <- finalize_workflow(
+  svm_tuned_workflow,
+  best_svm_params
+)
+
+# fit the final model 
+svm_final <- fit(svm_final_workflow, data = train_data)
+
+# define metric set
+svm_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- svm_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(svm_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+svm_test_results <- predictions %>%
+  svm_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+svm_test_results
+
+# make a confusion matrix
+svm_confusion_matrix <- predictions %>%     
+  conf_mat(truth = active, estimate = .pred_class)
+svm_confusion_matrix
+```
+
+#11.3 mlp smote
+
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(nnet)
+library(rsample)
+library(themis)
+
+tidymodels::tidymodels_prefer()
+
+mlp_data <- read_csv('data_subsets/norm_stand_ml_IBD.csv') %>%
+  mutate(active = factor(active, levels = c("y", "n")))
+
+set.seed(212)
+
+# SPLIT DATA -------------------------------------------------------------------
+# split into 80% training and 20% test data for controls
+data_split <- group_initial_split(mlp_data, prop = 0.8, group = study_id)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# INITIAL MODEL ----------------------------------------------------------------
+# initialize the recipe for the model
+mlp_recipe <- recipe (active ~ ., data = train_data) %>%
+  step_smote(active) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')
+
+# prep and juice recipe
+mlp_prep <- prep(mlp_recipe)
+mlp_juiced <- juice(mlp_prep)
+
+# define model
+mlp_model <- mlp(mode = "classification") %>%
+  set_engine("nnet")
+
+# build workflow
+mlp_workflow <- workflow() %>%
+  add_model(mlp_model) %>%
+  add_recipe(mlp_recipe)
+
+# fit model
+mlp_initial <- fit(mlp_workflow, data = train_data)
+mlp_initial
+
+# CROSS-VALIDATION -------------------------------------------------------------
+# perform 10-fold cross-validation
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+mlp_cv_results <- mlp_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+# print out accuracy, AUC and F1 score
+collect_metrics(mlp_cv_results)
+
+# HYPERPARAMETER TUNING --------------------------------------------------------
+# set up grid
+mlp_grid <- expand.grid(
+  hidden_units = c(5, 10, 20),       
+  penalty = c(0.001, 0.01, 0.1, 1),
+  epochs = c(100, 200, 500)
+)
+
+# define model
+mlp_tuned_model <- mlp(mode = "classification") %>%
+  set_engine("nnet") %>%
+  set_args(
+    hidden_units = tune(),
+    penalty = tune(),
+    epochs = tune()
+  )
+
+# build workflow
+mlp_tuned_workflow <- workflow() %>%
+  add_model(mlp_tuned_model) %>%
+  add_recipe(mlp_recipe)
+
+# perform 10-fold cross-validation for tuning
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+# tune model
+mlp_tuned_results <- mlp_tuned_workflow %>%
+  tune_grid(
+    resamples = cv_folds,
+    grid = mlp_grid,
+    metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)  
+  )
+
+tuning_results <- collect_metrics(mlp_tuned_results)
+
+# show best performance for f1 score metric...
+best_mlp_params <- select_best(mlp_tuned_results, metric = "f_meas")
+
+mlp_tuned_results %>%
+  collect_metrics() %>%
+  filter(.config == best_mlp_params$.config)
+
+# FINAL TUNED MODEL EVALUATION -------------------------------------------------
+# finalize workflow with optimal hyperparameters
+mlp_final_workflow <- finalize_workflow(
+  mlp_tuned_workflow,
+  best_mlp_params
+)
+
+# fit the final model 
+mlp_final <- fit(mlp_final_workflow, data = train_data)
+
+# define metric set
+mlp_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- mlp_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(mlp_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+mlp_test_results <- predictions %>%
+  mlp_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+mlp_test_results
+
+# make a confusion matrix
+mlp_confusion_matrix <- predictions %>%     
+  conf_mat(truth = active, estimate = .pred_class)
+mlp_confusion_matrix
+```
+
+#11.4 XGB smote
+```{r}
+library(xgboost)
+library(tidymodels)
+library(tidyverse)
+library(SHAPforxgboost)
+library(themis)
+
+tidymodels::tidymodels_prefer()
+
+xgb_data <- read_csv('data_subsets/ml_data_IBD.csv') %>%
+  # convert categorical factors to factor level %>%
+  select(-fcal, -alb, -esr, -crp) %>%
+  drop_na() %>%
+  mutate(active = factor(active, levels = c("y", "n")),  
+         pgas = as.factor(pgas), subtype = as.factor(subtype))
+set.seed(212)
+
+# SPLIT DATA -------------------------------------------------------------------
+# split into 80% training and 20% test data for controls
+data_split <- group_initial_split(xgb_data, prop = 0.8, group = study_id)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+xgb_model <- boost_tree(engine = 'xgboost') %>%
+  set_mode("classification")
+
+xgb_recipe <- recipe(active ~ ., data = train_data) %>%
+  step_smote(active) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')  
+
+xgb_workflow <- workflow() %>%
+  add_model(xgb_model) %>%
+  add_recipe(xgb_recipe)
+
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+xgb_cv_results <- xgb_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+# print out accuracy, AUC and F1 score
+collect_metrics(xgb_cv_results)
+
+xgb_tuned_model <- boost_tree(engine = 'xgboost') %>%
+  set_mode("classification") %>%
+  set_args(tree_depth = tune(),
+    learn_rate = tune(),
+    min_n = tune(),
+    mtry = tune(),
+    loss_reduction = tune())
+
+# perform 10-fold cross-validation for tuning
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+xgb_tuned_workflow <- workflow() %>%
+  add_model(xgb_tuned_model) %>%
+  add_recipe(xgb_recipe)
+
+xgb_grid <- expand.grid(
+  tree_depth = c(3, 5, 7),         
+  learn_rate = c(0.01, 0.1, 0.3),  
+  loss_reduction = c(0, 1, 10),    
+  min_n = c(5, 10, 20), 
+  mtry = c(3, 5, 7))
+
+xgb_tune_results <- tune_grid(xgb_tuned_workflow, resamples = cv_folds, grid = xgb_grid,
+  metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens))
+
+tuning_results <- collect_metrics(xgb_tune_results)
+
+# select optimal parameters based on F1 score
+best_xgb_params <- select_best(xgb_tune_results, metric = "f_meas")
+
+# show best performance for each metric...
+xgb_tune_results %>%
+  collect_metrics() %>%
+  filter(.config == best_xgb_params$.config)
+
+# SET FINAL MODEL --------------------------------------------------------------
+# finalize workflow with optimal hyperparameters
+xgb_final_workflow <- finalize_workflow(
+  xgb_tuned_workflow,
+  best_xgb_params
+)
+
+# fit the final model 
+xgb_final <- fit(xgb_final_workflow, data = train_data)
+
+# define metric set
+xgb_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- xgb_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(xgb_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+xgb_test_results <- predictions %>%
+  xgb_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+xgb_test_results
+
+# make a confusion matrix
+#confusion_matrix <- predictions %>%     
+#  conf_mat(truth = active, estimate = .pred_class)
+
+#print(confusion_matrix)
+
+# SHAP analysis ----------------------------------------------------------------
+# extract final model
+xgb_model <- extract_fit_engine(xgb_final)
+
+# convert training data to matrix form
+train_matrix <- train_data %>%
+  select(-active, -pgas, -subtype, -study_id) %>%  
+  as.matrix()
+
+# get shap values
+shap_values <- shap.prep(xgb_model = xgb_model, X_train = train_matrix)
+
+# CHANGE NAMES FOR GRAPHING!
+rename_labels <- c(Neut = 'Neutrophils',
+                   plt = "Platelets", hct = "Hematocrit", Mono = "Monocytes", 
+                   IFX = "Infliximab", Lymph = "Lymphocytes", Eosin = 'Eosinophils', 
+                   AZA = "Azathioprine", crp = "C-reactive protein", Baso = "Basophils",
+                   PRED = "Prednisone", male = 'Male', female = 'Female', ADL = 'Adalimumab',
+                   alb = 'Albumin', ASA = 'Acetylsalicylic acid', MTX = 'Methotrexate',
+                   fcal = 'Fecal calprotectin', BUD = "Budesonide", USTE = 'Ustekinumab', 
+                   esr = 'ESR', VEDO = "Vedolizumab")
+
+shap_values_renamed <- shap_values %>%
+  mutate(variable = recode(variable, !!!rename_labels))
+
+# make summary plot
+shap.plot.summary(shap_values_renamed)
+
+ggsave(plot = last_plot(), 'plots/xgb_SHAP.png', width = 8, height = 5)
+
+# ROC-AUC curve ----------------------------------------------------------------
+roc_data <- roc_curve(predictions, truth = active, .pred_y)
+
+# plot curve
+roc_plot <- ggplot(roc_data, aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(color = "darkblue", linewidth = 1) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  coord_equal() +
+  labs(
+    title = "ROC Curve for XGBoost Model",
+    x = "1 - Specificity (False Positive Rate)",
+    y = "Sensitivity (True Positive Rate)"
+  ) +
+  theme_minimal()
+
+ggsave(plot = roc_plot, file = 'plots/ROC_XGB.png')
+
+# Confusion matrix -------------------------------------------------------------
+# re-code the predictions y and n as full words for graph legibility
+predictions <- predictions %>%
+  mutate(active = recode(active, y = "Active", n = "Remission"),
+    .pred_class = recode(.pred_class, y = "Active", n = "Remission"))
+
+# create the confusion matrix
+conf_mat_obj <- conf_mat(predictions, truth = active, estimate = .pred_class)
+
+# plot matrix
+confusion_plot <- autoplot(conf_mat_obj, type = "heatmap") +
+  scale_fill_gradient(low = "lightblue", high = "navy", limits = c(20, 220))+
+  labs(title = "Confusion Matrix XGBoost", x = "Predicted", y = "Actual") +
+  theme_minimal()
+
+confusion_plot
+
+ggsave(plot = confusion_plot, file = 'plots/confusion_mat_XGB.png')
+
+xgb_confusion_matrix <- predictions %>%     
+  conf_mat(truth = active, estimate = .pred_class)
+xgb_confusion_matrix
+
+```
+
+#11.5 glm smote
+
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(rsample)
+library(themis)
+
+tidymodels::tidymodels_prefer()
+
+glm_data <- read_csv('data_subsets/norm_stand_ml_IBD.csv') %>%
+  mutate(active = factor(active, levels = c("y", "n")))
+
+set.seed(212)
+
+# SPLIT DATA -------------------------------------------------------------------
+# split into 80% training and 20% test data for controls
+data_split <- group_initial_split(glm_data, prop = 0.8, group = study_id)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# INITIAL MODEL ----------------------------------------------------------------
+# initialize the recipe for the model
+glm_recipe <- recipe (active ~ ., data = train_data) %>%
+  step_smote(active) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')
+
+# prep and juice recipe
+glm_prep <- prep(glm_recipe)
+glm_juiced <- juice(glm_prep)
+
+# define model
+glm_model <- logistic_reg() %>%
+  set_engine("glm")
+
+# build workflow
+glm_workflow <- workflow() %>%
+  add_model(glm_model) %>%
+  add_recipe(glm_recipe)
+
+# fit model
+glm_initial <- fit(glm_workflow, data = train_data)
+glm_initial
+
+# CROSS-VALIDATION -------------------------------------------------------------
+# perform 10-fold cross-validation
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+glm_cv_results <- glm_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+
+
+# show best performance for f1 score metric...
+best_glm_params <- select_best(glm_cv_results, metric = "f_meas")
+
+glm_cv_results %>%
+  collect_metrics() %>%
+  filter(.config == best_glm_params$.config)
+
+# FINAL MODEL EVALUATION -------------------------------------------------
+# finalize workflow
+glm_final_workflow <- finalize_workflow(
+  glm_workflow,
+  best_glm_params
+)
+
+# fit the final model 
+glm_final <- fit(glm_final_workflow, data = train_data)
+
+# define metric set
+glm_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- glm_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(glm_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+glm_test_results <- predictions %>%
+  glm_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+glm_test_results
+
+glm_confusion_matrix <- predictions %>%     
+  conf_mat(truth = active, estimate = .pred_class)
+glm_confusion_matrix
+```
+#12.1 smote benchmarks
+
+running MLP and XGB with downsampling instead of smote to compare effectiveness
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(nnet)
+library(rsample)
+library(themis)
+
+tidymodels::tidymodels_prefer()
+
+mlp_data <- read_csv('data_subsets/norm_stand_ml_IBD.csv') %>%
+  mutate(active = factor(active, levels = c("y", "n")))
+
+set.seed(212)
+
+# SPLIT DATA -------------------------------------------------------------------
+# split into 80% training and 20% test data for controls
+data_split <- group_initial_split(mlp_data, prop = 0.8, group = study_id)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# INITIAL MODEL ----------------------------------------------------------------
+# initialize the recipe for the model
+mlp_recipe <- recipe (active ~ ., data = train_data) %>%
+  step_downsample(active) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')
+
+# prep and juice recipe
+mlp_prep <- prep(mlp_recipe)
+mlp_juiced <- juice(mlp_prep)
+
+# define model
+mlp_model <- mlp(mode = "classification") %>%
+  set_engine("nnet")
+
+# build workflow
+mlp_workflow <- workflow() %>%
+  add_model(mlp_model) %>%
+  add_recipe(mlp_recipe)
+
+# fit model
+mlp_initial <- fit(mlp_workflow, data = train_data)
+mlp_initial
+
+# CROSS-VALIDATION -------------------------------------------------------------
+# perform 10-fold cross-validation
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+mlp_cv_results <- mlp_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+# print out accuracy, AUC and F1 score
+collect_metrics(mlp_cv_results)
+
+# HYPERPARAMETER TUNING --------------------------------------------------------
+# set up grid
+mlp_grid <- expand.grid(
+  hidden_units = c(5, 10, 20),       
+  penalty = c(0.001, 0.01, 0.1, 1),
+  epochs = c(100, 200, 500)
+)
+
+# define model
+mlp_tuned_model <- mlp(mode = "classification") %>%
+  set_engine("nnet") %>%
+  set_args(
+    hidden_units = tune(),
+    penalty = tune(),
+    epochs = tune()
+  )
+
+# build workflow
+mlp_tuned_workflow <- workflow() %>%
+  add_model(mlp_tuned_model) %>%
+  add_recipe(mlp_recipe)
+
+# perform 10-fold cross-validation for tuning
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+# tune model
+mlp_tuned_results <- mlp_tuned_workflow %>%
+  tune_grid(
+    resamples = cv_folds,
+    grid = mlp_grid,
+    metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)  
+  )
+
+tuning_results <- collect_metrics(mlp_tuned_results)
+
+# show best performance for f1 score metric...
+best_mlp_params <- select_best(mlp_tuned_results, metric = "f_meas")
+
+mlp_tuned_results %>%
+  collect_metrics() %>%
+  filter(.config == best_mlp_params$.config)
+
+# FINAL TUNED MODEL EVALUATION -------------------------------------------------
+# finalize workflow with optimal hyperparameters
+mlp_final_workflow <- finalize_workflow(
+  mlp_tuned_workflow,
+  best_mlp_params
+)
+
+# fit the final model 
+mlp_final <- fit(mlp_final_workflow, data = train_data)
+
+# define metric set
+mlp_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- mlp_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(mlp_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+mlp_test_results <- predictions %>%
+  mlp_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+mlp_test_results
+
+# make a confusion matrix
+mlp_down_confusion_matrix <- predictions %>%     
+  conf_mat(truth = active, estimate = .pred_class)
+mlp_down_confusion_matrix
+```
+
+```{r}
+library(xgboost)
+library(tidymodels)
+library(tidyverse)
+library(SHAPforxgboost)
+library(themis)
+
+tidymodels::tidymodels_prefer()
+
+xgb_data <- read_csv('data_subsets/ml_data_IBD.csv') %>%
+  # convert categorical factors to factor level %>%
+  select(-fcal, -alb, -esr, -crp) %>%
+  drop_na() %>%
+  mutate(active = factor(active, levels = c("y", "n")),  
+         pgas = as.factor(pgas), subtype = as.factor(subtype))
+set.seed(212)
+
+# SPLIT DATA -------------------------------------------------------------------
+# split into 80% training and 20% test data for controls
+data_split <- group_initial_split(xgb_data, prop = 0.8, group = study_id)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+xgb_model <- boost_tree(engine = 'xgboost') %>%
+  set_mode("classification")
+
+xgb_recipe <- recipe(active ~ ., data = train_data) %>%
+  step_downsample(active) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')  
+
+xgb_workflow <- workflow() %>%
+  add_model(xgb_model) %>%
+  add_recipe(xgb_recipe)
+
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+xgb_cv_results <- xgb_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+# print out accuracy, AUC and F1 score
+collect_metrics(xgb_cv_results)
+
+xgb_tuned_model <- boost_tree(engine = 'xgboost') %>%
+  set_mode("classification") %>%
+  set_args(tree_depth = tune(),
+    learn_rate = tune(),
+    min_n = tune(),
+    mtry = tune(),
+    loss_reduction = tune())
+
+# perform 10-fold cross-validation for tuning
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+xgb_tuned_workflow <- workflow() %>%
+  add_model(xgb_tuned_model) %>%
+  add_recipe(xgb_recipe)
+
+xgb_grid <- expand.grid(
+  tree_depth = c(3, 5, 7),         
+  learn_rate = c(0.01, 0.1, 0.3),  
+  loss_reduction = c(0, 1, 10),    
+  min_n = c(5, 10, 20), 
+  mtry = c(3, 5, 7))
+
+xgb_tune_results <- tune_grid(xgb_tuned_workflow, resamples = cv_folds, grid = xgb_grid,
+  metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens))
+
+tuning_results <- collect_metrics(xgb_tune_results)
+
+# select optimal parameters based on F1 score
+best_xgb_params <- select_best(xgb_tune_results, metric = "f_meas")
+
+# show best performance for each metric...
+xgb_tune_results %>%
+  collect_metrics() %>%
+  filter(.config == best_xgb_params$.config)
+
+# SET FINAL MODEL --------------------------------------------------------------
+# finalize workflow with optimal hyperparameters
+xgb_final_workflow <- finalize_workflow(
+  xgb_tuned_workflow,
+  best_xgb_params
+)
+
+# fit the final model 
+xgb_final <- fit(xgb_final_workflow, data = train_data)
+
+# define metric set
+xgb_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- xgb_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(xgb_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+xgb_test_results <- predictions %>%
+  xgb_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+xgb_test_results
+
+# make a confusion matrix
+#confusion_matrix <- predictions %>%     
+#  conf_mat(truth = active, estimate = .pred_class)
+
+#print(confusion_matrix)
+
+# SHAP analysis ----------------------------------------------------------------
+# extract final model
+xgb_model <- extract_fit_engine(xgb_final)
+
+# convert training data to matrix form
+train_matrix <- train_data %>%
+  select(-active, -pgas, -subtype, -study_id) %>%  
+  as.matrix()
+
+# get shap values
+shap_values <- shap.prep(xgb_model = xgb_model, X_train = train_matrix)
+
+# CHANGE NAMES FOR GRAPHING!
+rename_labels <- c(Neut = 'Neutrophils',
+                   plt = "Platelets", hct = "Hematocrit", Mono = "Monocytes", 
+                   IFX = "Infliximab", Lymph = "Lymphocytes", Eosin = 'Eosinophils', 
+                   AZA = "Azathioprine", crp = "C-reactive protein", Baso = "Basophils",
+                   PRED = "Prednisone", male = 'Male', female = 'Female', ADL = 'Adalimumab',
+                   alb = 'Albumin', ASA = 'Acetylsalicylic acid', MTX = 'Methotrexate',
+                   fcal = 'Fecal calprotectin', BUD = "Budesonide", USTE = 'Ustekinumab', 
+                   esr = 'ESR', VEDO = "Vedolizumab")
+
+shap_values_renamed <- shap_values %>%
+  mutate(variable = recode(variable, !!!rename_labels))
+
+# make summary plot
+shap.plot.summary(shap_values_renamed)
+
+ggsave(plot = last_plot(), 'plots/xgb_SHAP.png', width = 8, height = 5)
+
+# ROC-AUC curve ----------------------------------------------------------------
+roc_data <- roc_curve(predictions, truth = active, .pred_y)
+
+# plot curve
+roc_plot <- ggplot(roc_data, aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(color = "darkblue", linewidth = 1) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  coord_equal() +
+  labs(
+    title = "ROC Curve for XGBoost Model",
+    x = "1 - Specificity (False Positive Rate)",
+    y = "Sensitivity (True Positive Rate)"
+  ) +
+  theme_minimal()
+
+ggsave(plot = roc_plot, file = 'plots/ROC_XGB.png')
+
+# Confusion matrix -------------------------------------------------------------
+# re-code the predictions y and n as full words for graph legibility
+predictions <- predictions %>%
+  mutate(active = recode(active, y = "Active", n = "Remission"),
+    .pred_class = recode(.pred_class, y = "Active", n = "Remission"))
+
+# create the confusion matrix
+conf_mat_obj <- conf_mat(predictions, truth = active, estimate = .pred_class)
+
+# plot matrix
+confusion_plot <- autoplot(conf_mat_obj, type = "heatmap") +
+  scale_fill_gradient(low = "lightblue", high = "navy", limits = c(20, 220))+
+  labs(title = "Confusion Matrix XGBoost", x = "Predicted", y = "Actual") +
+  theme_minimal()
+
+confusion_plot
+
+ggsave(plot = confusion_plot, file = 'plots/confusion_mat_XGB.png')
+
+xgb_down_confusion_matrix <- predictions %>%     
+  conf_mat(truth = active, estimate = .pred_class)
+xgb_down_confusion_matrix
+```
+#12.2 medication benchmark
+
+running the glm smote model without medication included in the dataset
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(rsample)
+library(themis)
+
+tidymodels::tidymodels_prefer()
+
+glm_data <- read_csv('data_subsets/norm_stand_stats_IBD.csv') %>%
+  mutate(active = factor(active, levels = c("y", "n")))
+
+set.seed(212)
+
+# SPLIT DATA -------------------------------------------------------------------
+# split into 80% training and 20% test data for controls
+data_split <- group_initial_split(glm_data, prop = 0.8, group = study_id)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# INITIAL MODEL ----------------------------------------------------------------
+# initialize the recipe for the model
+glm_recipe <- recipe (active ~ ., data = train_data) %>%
+  step_dummy(sex) %>%
+  step_smote(active) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')
+
+# prep and juice recipe
+glm_prep <- prep(glm_recipe)
+glm_juiced <- juice(glm_prep)
+
+# define model
+glm_model <- logistic_reg() %>%
+  set_engine("glm")
+
+# build workflow
+glm_workflow <- workflow() %>%
+  add_model(glm_model) %>%
+  add_recipe(glm_recipe)
+
+# fit model
+glm_initial <- fit(glm_workflow, data = train_data)
+glm_initial
+
+# CROSS-VALIDATION -------------------------------------------------------------
+# perform 10-fold cross-validation
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+glm_cv_results <- glm_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+
+
+# show best performance for f1 score metric...
+best_glm_params <- select_best(glm_cv_results, metric = "f_meas")
+
+glm_cv_results %>%
+  collect_metrics() %>%
+  filter(.config == best_glm_params$.config)
+
+# FINAL MODEL EVALUATION -------------------------------------------------
+# finalize workflow
+glm_final_workflow <- finalize_workflow(
+  glm_workflow,
+  best_glm_params
+)
+
+# fit the final model 
+glm_final <- fit(glm_final_workflow, data = train_data)
+
+# define metric set
+glm_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- glm_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(glm_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+glm_test_results <- predictions %>%
+  glm_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+glm_test_results
+
+glm_no_meds_confusion_matrix <- predictions %>%     
+  conf_mat(truth = active, estimate = .pred_class)
+glm_no_meds_confusion_matrix
+```
+mlp without meds
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(nnet)
+library(rsample)
+library(themis)
+
+tidymodels::tidymodels_prefer()
+
+mlp_data <- read_csv('data_subsets/norm_stand_stats_IBD.csv') %>%
+  mutate(active = factor(active, levels = c("y", "n")))
+
+set.seed(212)
+
+# SPLIT DATA -------------------------------------------------------------------
+# split into 80% training and 20% test data for controls
+data_split <- group_initial_split(mlp_data, prop = 0.8, group = study_id)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# INITIAL MODEL ----------------------------------------------------------------
+# initialize the recipe for the model
+mlp_recipe <- recipe (active ~ ., data = train_data) %>%
+  step_dummy(sex) %>%
+  step_smote(active) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')
+
+# prep and juice recipe
+mlp_prep <- prep(mlp_recipe)
+mlp_juiced <- juice(mlp_prep)
+
+# define model
+mlp_model <- mlp(mode = "classification") %>%
+  set_engine("nnet")
+
+# build workflow
+mlp_workflow <- workflow() %>%
+  add_model(mlp_model) %>%
+  add_recipe(mlp_recipe)
+
+# fit model
+mlp_initial <- fit(mlp_workflow, data = train_data)
+mlp_initial
+
+# CROSS-VALIDATION -------------------------------------------------------------
+# perform 10-fold cross-validation
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+mlp_cv_results <- mlp_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+# print out accuracy, AUC and F1 score
+collect_metrics(mlp_cv_results)
+
+# HYPERPARAMETER TUNING --------------------------------------------------------
+# set up grid
+mlp_grid <- expand.grid(
+  hidden_units = c(5, 10, 20),       
+  penalty = c(0.001, 0.01, 0.1, 1),
+  epochs = c(100, 200, 500)
+)
+
+# define model
+mlp_tuned_model <- mlp(mode = "classification") %>%
+  set_engine("nnet") %>%
+  set_args(
+    hidden_units = tune(),
+    penalty = tune(),
+    epochs = tune()
+  )
+
+# build workflow
+mlp_tuned_workflow <- workflow() %>%
+  add_model(mlp_tuned_model) %>%
+  add_recipe(mlp_recipe)
+
+# perform 10-fold cross-validation for tuning
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+# tune model
+mlp_tuned_results <- mlp_tuned_workflow %>%
+  tune_grid(
+    resamples = cv_folds,
+    grid = mlp_grid,
+    metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)  
+  )
+
+tuning_results <- collect_metrics(mlp_tuned_results)
+
+# show best performance for f1 score metric...
+best_mlp_params <- select_best(mlp_tuned_results, metric = "f_meas")
+
+mlp_tuned_results %>%
+  collect_metrics() %>%
+  filter(.config == best_mlp_params$.config)
+
+# FINAL TUNED MODEL EVALUATION -------------------------------------------------
+# finalize workflow with optimal hyperparameters
+mlp_final_workflow <- finalize_workflow(
+  mlp_tuned_workflow,
+  best_mlp_params
+)
+
+# fit the final model 
+mlp_final <- fit(mlp_final_workflow, data = train_data)
+
+# define metric set
+mlp_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- mlp_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(mlp_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+mlp_test_results <- predictions %>%
+  mlp_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+mlp_test_results
+
+# make a confusion matrix
+mlp_no_meds_confusion_matrix <- predictions %>%     
+  conf_mat(truth = active, estimate = .pred_class)
+mlp_no_meds_confusion_matrix
+```
+
+#13.1 Generate pediatric-only dataset
+
+generate a version of the standardized dataset that includes age. med has been removed due to the potential to skew a smaller sample size dataset
+```{r}
+library(tidyverse)
+library(e1071)
+library(mice)
+
+if (!dir.exists("data_subsets")) {
+  dir.create("data_subsets")
+}
+
+data <- read_csv('diff_study_2024-09-23_edited_10-22_fixed.csv')
+
+machine_learning_data <- data %>%
+  # filter dataset to only patients with IBD
+  filter(subtype %in% c('CD','UC','IBD-U')) %>%
+  
+  # remove variables not needed for ML
+  select(-imagine_sample_w_in_3_mo,-matching_id, -Date) %>%
+  
+  # make sure pgas category is only mild
+  filter(pgas %in% c('mild', 'mod', 'severe', 'rem')) %>%
+  
+  # make sure active category is only yes/no
+  filter(active %in% c('y','n')) %>%
+  
+  # encode categorical variable sex with one-hot encoding
+  mutate(value = 1) %>%  
+  pivot_wider(names_from = sex, values_from = value, values_fill = 0)
+  
+ #remove med (potential to skew analysis at low sample size) and hb (correlates too strongly with hct)
+  machine_learning_data <- machine_learning_data %>%
+  select(-med, -hb)
+
+write_csv(x = machine_learning_data, file = 'data_subsets/1.csv')
+
+# Make the normalized & standardized datasets
+# ---------------------------------------------------------------------------------
+norm_stand_data <- machine_learning_data
+
+# find percent missingness in each column
+for (col in colnames(norm_stand_data)) {
+  cat('Column:', col, '\t\tMissing (%):', mean(is.na(norm_stand_data[[col]])) * 100, '\n')
+}
+
+# remove variables with the highest missingness
+norm_stand_data <- norm_stand_data %>%
+  select(-fcal, -esr)
+
+# MICE imputing
+imputed_data <- mice(norm_stand_data, m = 5, method = "pmm", seed = 123)
+norm_stand_data <- complete(imputed_data, 1)
+
+# test for skewness in data for all non-binary predictors
+## skew < 0 means left skew
+## skew > 0 means right skew
+## skew ~ 0 means centered
+skew_values <- sapply(norm_stand_data[c(5:9,11:14)], function(x) if(is.numeric(x)) skewness(x, na.rm = TRUE) else NA)
+skew_values
+
+left_skew <- list()
+right_skew <- list()
+no_skew <- list()
+
+# find out if the distribution of each variable is left, right or un-skewed
+for (test_name in names(skew_values)){
+  test_value <- skew_values[test_name]
+  
+  if (is.na(test_value)) {
+    next  
+  }
+  
+  if (test_value > 0.5){
+    right_skew <- append(right_skew, c(test_name))
+  }
+  
+  else if (test_value < -0.5){
+    left_skew <- append(left_skew, c(test_name))
+  }
+  
+  else{
+    no_skew <- append(no_skew, c(test_name))
+  }
+}
+
+# print out which variables fall in which skew category
+cat("Right Skew: ", unlist(right_skew), "\n", sep = " ")
+cat("Left Skew: ", unlist(left_skew), "\n", sep = " ")
+cat("Negligible Skew: ", unlist(no_skew), "\n", sep = " ")
+
+# log-transform right skewed variables
+for (col_name in right_skew) {
+  norm_stand_data[[col_name]] <- log10(norm_stand_data[[col_name]]+0.1)
+}
+
+# square transform all left-skewed variables
+for (col_name in left_skew) {
+  norm_stand_data[[col_name]] <- norm_stand_data[[col_name]]^2
+}
+
+# normalize all numeric variables 
+norm_stand_data <- norm_stand_data %>%
+  mutate(across(c(5:9,11:14), ~ scale(.x) %>% as.vector()))
+
+# check class type 
+sapply(norm_stand_data, class)
+
+# write to .csv file
+write_csv(x = norm_stand_data, file = 'data_subsets/ped_stand_impute_IBD.csv')
+
+
+
+#repeat without imputing any data:
+
+
+
+norm_stand_data <- machine_learning_data
+
+# find percent missingness in each column
+for (col in colnames(norm_stand_data)) {
+  cat('Column:', col, '\t\tMissing (%):', mean(is.na(norm_stand_data[[col]])) * 100, '\n')
+}
+
+# remove variables with the highest missingness
+norm_stand_data <- norm_stand_data %>%
+  select(-fcal, -esr)
+
+
+
+# test for skewness in data for all non-binary predictors
+## skew < 0 means left skew
+## skew > 0 means right skew
+## skew ~ 0 means centered
+skew_values <- sapply(norm_stand_data[c(5:9,11:14)], function(x) if(is.numeric(x)) skewness(x, na.rm = TRUE) else NA)
+skew_values
+
+left_skew <- list()
+right_skew <- list()
+no_skew <- list()
+
+# find out if the distribution of each variable is left, right or un-skewed
+for (test_name in names(skew_values)){
+  test_value <- skew_values[test_name]
+  
+  if (is.na(test_value)) {
+    next  
+  }
+  
+  if (test_value > 0.5){
+    right_skew <- append(right_skew, c(test_name))
+  }
+  
+  else if (test_value < -0.5){
+    left_skew <- append(left_skew, c(test_name))
+  }
+  
+  else{
+    no_skew <- append(no_skew, c(test_name))
+  }
+}
+
+# print out which variables fall in which skew category
+cat("Right Skew: ", unlist(right_skew), "\n", sep = " ")
+cat("Left Skew: ", unlist(left_skew), "\n", sep = " ")
+cat("Negligible Skew: ", unlist(no_skew), "\n", sep = " ")
+
+# log-transform right skewed variables
+for (col_name in right_skew) {
+  norm_stand_data[[col_name]] <- log10(norm_stand_data[[col_name]]+0.1)
+}
+
+# square transform all left-skewed variables
+for (col_name in left_skew) {
+  norm_stand_data[[col_name]] <- norm_stand_data[[col_name]]^2
+}
+
+# normalize all numeric variables 
+norm_stand_data <- norm_stand_data %>%
+  mutate(across(c(5:9,11:14), ~ scale(.x) %>% as.vector()))
+
+# check class type 
+sapply(norm_stand_data, class)
+
+# write to .csv file
+write_csv(x = norm_stand_data, file = 'data_subsets/ped_stand_IBD.csv')  
+```
+
+
+splitting dataset to exclude patients 18 and older
+```{r}
+library(tidyverse)
+library(dplyr)
+library(car)
+library(Hmisc)
+
+pediatric_data <- read_csv('data_subsets/ped_stand_IBD.csv') %>%
+  mutate(active = factor(active, levels = c("y", "n"))) |>
+  mutate(pediatric = ifelse(age <= 18, 'pediatric', NA)) |>
+  drop_na() |>
+  select(-pediatric)
+pediatric_imputed_data <- read_csv('data_subsets/ped_stand_impute_IBD.csv') %>%
+  mutate(active = factor(active, levels = c("y", "n"))) |>
+  mutate(pediatric = ifelse(age <= 18, 'pediatric', NA)) |>
+  drop_na() |>
+  select(-pediatric)
+```
+
+#13.2 pediatric MLP -alb
+
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(nnet)
+library(rsample)
+library(themis)
+
+tidymodels::tidymodels_prefer()
+
+mlp_data <- pediatric_data %>%
+  mutate(active = factor(active, levels = c("y", "n"))) |>
+  select(-alb)
+
+set.seed(212)
+
+# SPLIT DATA -------------------------------------------------------------------
+# split into 70% training and 30% test data for controls
+data_split <- group_initial_split(mlp_data, prop = 0.7, group = study_id)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# INITIAL MODEL ----------------------------------------------------------------
+# initialize the recipe for the model
+mlp_recipe <- recipe (active ~ ., data = train_data) %>%
+  step_smote(active) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')
+
+# prep and juice recipe
+mlp_prep <- prep(mlp_recipe)
+mlp_juiced <- juice(mlp_prep)
+
+# define model
+mlp_model <- mlp(mode = "classification") %>%
+  set_engine("nnet")
+
+# build workflow
+mlp_workflow <- workflow() %>%
+  add_model(mlp_model) %>%
+  add_recipe(mlp_recipe)
+
+# fit model
+mlp_initial <- fit(mlp_workflow, data = train_data)
+mlp_initial
+
+# CROSS-VALIDATION -------------------------------------------------------------
+# perform 10-fold cross-validation
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+mlp_cv_results <- mlp_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+# print out accuracy, AUC and F1 score
+collect_metrics(mlp_cv_results)
+
+# HYPERPARAMETER TUNING --------------------------------------------------------
+# set up grid
+mlp_grid <- expand.grid(
+  hidden_units = c(5, 10, 20),       
+  penalty = c(0.001, 0.01, 0.1, 1),
+  epochs = c(100, 200, 500)
+)
+
+# define model
+mlp_tuned_model <- mlp(mode = "classification") %>%
+  set_engine("nnet") %>%
+  set_args(
+    hidden_units = tune(),
+    penalty = tune(),
+    epochs = tune()
+  )
+
+# build workflow
+mlp_tuned_workflow <- workflow() %>%
+  add_model(mlp_tuned_model) %>%
+  add_recipe(mlp_recipe)
+
+# perform 10-fold cross-validation for tuning
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+# tune model
+mlp_tuned_results <- mlp_tuned_workflow %>%
+  tune_grid(
+    resamples = cv_folds,
+    grid = mlp_grid,
+    metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)  
+  )
+
+tuning_results <- collect_metrics(mlp_tuned_results)
+
+# show best performance for f1 score metric...
+best_mlp_params <- select_best(mlp_tuned_results, metric = "f_meas")
+
+mlp_tuned_results %>%
+  collect_metrics() %>%
+  filter(.config == best_mlp_params$.config)
+
+# FINAL TUNED MODEL EVALUATION -------------------------------------------------
+# finalize workflow with optimal hyperparameters
+mlp_final_workflow <- finalize_workflow(
+  mlp_tuned_workflow,
+  best_mlp_params
+)
+
+# fit the final model 
+mlp_final <- fit(mlp_final_workflow, data = train_data)
+
+# define metric set
+mlp_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- mlp_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(mlp_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+mlp_test_results <- predictions %>%
+  mlp_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+mlp_test_results
+
+# make a confusion matrix
+mlp_confusion_matrix <- predictions %>%     
+  conf_mat(truth = active, estimate = .pred_class)
+print(mlp_confusion_matrix)
+```
+
+#13.3 pediatric MLP -alb, imputed
+
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(nnet)
+library(rsample)
+library(themis)
+
+tidymodels::tidymodels_prefer()
+
+mlp_data <- pediatric_imputed_data %>%
+  mutate(active = factor(active, levels = c("y", "n"))) |>
+  select(-alb)
+
+set.seed(212)
+
+# SPLIT DATA -------------------------------------------------------------------
+# split into 70% training and 30% test data for controls
+data_split <- group_initial_split(mlp_data, prop = 0.7, group = study_id)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# INITIAL MODEL ----------------------------------------------------------------
+# initialize the recipe for the model
+mlp_recipe <- recipe (active ~ ., data = train_data) %>%
+  step_smote(active) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')
+
+# prep and juice recipe
+mlp_prep <- prep(mlp_recipe)
+mlp_juiced <- juice(mlp_prep)
+
+# define model
+mlp_model <- mlp(mode = "classification") %>%
+  set_engine("nnet")
+
+# build workflow
+mlp_workflow <- workflow() %>%
+  add_model(mlp_model) %>%
+  add_recipe(mlp_recipe)
+
+# fit model
+mlp_initial <- fit(mlp_workflow, data = train_data)
+mlp_initial
+
+# CROSS-VALIDATION -------------------------------------------------------------
+# perform 10-fold cross-validation
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+mlp_cv_results <- mlp_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+# print out accuracy, AUC and F1 score
+collect_metrics(mlp_cv_results)
+
+# HYPERPARAMETER TUNING --------------------------------------------------------
+# set up grid
+mlp_grid <- expand.grid(
+  hidden_units = c(5, 10, 20),       
+  penalty = c(0.001, 0.01, 0.1, 1),
+  epochs = c(100, 200, 500)
+)
+
+# define model
+mlp_tuned_model <- mlp(mode = "classification") %>%
+  set_engine("nnet") %>%
+  set_args(
+    hidden_units = tune(),
+    penalty = tune(),
+    epochs = tune()
+  )
+
+# build workflow
+mlp_tuned_workflow <- workflow() %>%
+  add_model(mlp_tuned_model) %>%
+  add_recipe(mlp_recipe)
+
+# perform 10-fold cross-validation for tuning
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+# tune model
+mlp_tuned_results <- mlp_tuned_workflow %>%
+  tune_grid(
+    resamples = cv_folds,
+    grid = mlp_grid,
+    metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)  
+  )
+
+tuning_results <- collect_metrics(mlp_tuned_results)
+
+# show best performance for f1 score metric...
+best_mlp_params <- select_best(mlp_tuned_results, metric = "f_meas")
+
+mlp_tuned_results %>%
+  collect_metrics() %>%
+  filter(.config == best_mlp_params$.config)
+
+# FINAL TUNED MODEL EVALUATION -------------------------------------------------
+# finalize workflow with optimal hyperparameters
+mlp_final_workflow <- finalize_workflow(
+  mlp_tuned_workflow,
+  best_mlp_params
+)
+
+# fit the final model 
+mlp_final <- fit(mlp_final_workflow, data = train_data)
+
+# define metric set
+mlp_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- mlp_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(mlp_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+mlp_test_results <- predictions %>%
+  mlp_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+mlp_test_results
+
+# make a confusion matrix
+mlp_confusion_matrix <- predictions %>%     
+  conf_mat(truth = active, estimate = .pred_class)
+print(mlp_confusion_matrix)
+```
+
+#13.4 pediatric MLP with alb
+
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(nnet)
+library(rsample)
+library(themis)
+
+tidymodels::tidymodels_prefer()
+
+mlp_data <- pediatric_data %>%
+  mutate(active = factor(active, levels = c("y", "n")))
+
+set.seed(212)
+
+# SPLIT DATA -------------------------------------------------------------------
+# split into 70% training and 30% test data for controls
+data_split <- group_initial_split(mlp_data, prop = 0.7, group = study_id)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# INITIAL MODEL ----------------------------------------------------------------
+# initialize the recipe for the model
+mlp_recipe <- recipe (active ~ ., data = train_data) %>%
+  step_smote(active) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')
+
+# prep and juice recipe
+mlp_prep <- prep(mlp_recipe)
+mlp_juiced <- juice(mlp_prep)
+
+# define model
+mlp_model <- mlp(mode = "classification") %>%
+  set_engine("nnet")
+
+# build workflow
+mlp_workflow <- workflow() %>%
+  add_model(mlp_model) %>%
+  add_recipe(mlp_recipe)
+
+# fit model
+mlp_initial <- fit(mlp_workflow, data = train_data)
+mlp_initial
+
+# CROSS-VALIDATION -------------------------------------------------------------
+# perform 10-fold cross-validation
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+mlp_cv_results <- mlp_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+# print out accuracy, AUC and F1 score
+collect_metrics(mlp_cv_results)
+
+# HYPERPARAMETER TUNING --------------------------------------------------------
+# set up grid
+mlp_grid <- expand.grid(
+  hidden_units = c(5, 10, 20),       
+  penalty = c(0.001, 0.01, 0.1, 1),
+  epochs = c(100, 200, 500)
+)
+
+# define model
+mlp_tuned_model <- mlp(mode = "classification") %>%
+  set_engine("nnet") %>%
+  set_args(
+    hidden_units = tune(),
+    penalty = tune(),
+    epochs = tune()
+  )
+
+# build workflow
+mlp_tuned_workflow <- workflow() %>%
+  add_model(mlp_tuned_model) %>%
+  add_recipe(mlp_recipe)
+
+# perform 10-fold cross-validation for tuning
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+# tune model
+mlp_tuned_results <- mlp_tuned_workflow %>%
+  tune_grid(
+    resamples = cv_folds,
+    grid = mlp_grid,
+    metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)  
+  )
+
+tuning_results <- collect_metrics(mlp_tuned_results)
+
+# show best performance for f1 score metric...
+best_mlp_params <- select_best(mlp_tuned_results, metric = "f_meas")
+
+mlp_tuned_results %>%
+  collect_metrics() %>%
+  filter(.config == best_mlp_params$.config)
+
+# FINAL TUNED MODEL EVALUATION -------------------------------------------------
+# finalize workflow with optimal hyperparameters
+mlp_final_workflow <- finalize_workflow(
+  mlp_tuned_workflow,
+  best_mlp_params
+)
+
+# fit the final model 
+mlp_final <- fit(mlp_final_workflow, data = train_data)
+
+# define metric set
+mlp_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- mlp_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(mlp_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+mlp_test_results <- predictions %>%
+  mlp_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+mlp_test_results
+
+# make a confusion matrix
+mlp_confusion_matrix <- predictions %>%     
+  conf_mat(truth = active, estimate = .pred_class)
+print(mlp_confusion_matrix)
+```
+
+
+#13.5 pediatric MLP with alb, imputed
+
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(nnet)
+library(rsample)
+library(themis)
+
+tidymodels::tidymodels_prefer()
+
+mlp_data <- pediatric_imputed_data %>%
+  mutate(active = factor(active, levels = c("y", "n")))
+
+set.seed(212)
+
+# SPLIT DATA -------------------------------------------------------------------
+# split into 70% training and 30% test data for controls
+data_split <- group_initial_split(mlp_data, prop = 0.7, group = study_id)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# INITIAL MODEL ----------------------------------------------------------------
+# initialize the recipe for the model
+mlp_recipe <- recipe (active ~ ., data = train_data) %>%
+  step_smote(active) %>%
+  update_role(subtype, pgas, study_id, new_role = 'ID')
+
+# prep and juice recipe
+mlp_prep <- prep(mlp_recipe)
+mlp_juiced <- juice(mlp_prep)
+
+# define model
+mlp_model <- mlp(mode = "classification") %>%
+  set_engine("nnet")
+
+# build workflow
+mlp_workflow <- workflow() %>%
+  add_model(mlp_model) %>%
+  add_recipe(mlp_recipe)
+
+# fit model
+mlp_initial <- fit(mlp_workflow, data = train_data)
+mlp_initial
+
+# CROSS-VALIDATION -------------------------------------------------------------
+# perform 10-fold cross-validation
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+mlp_cv_results <- mlp_workflow %>%
+  fit_resamples(resamples = cv_folds, 
+                metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens), 
+                control = control_resamples(save_pred = TRUE))
+
+# print out accuracy, AUC and F1 score
+collect_metrics(mlp_cv_results)
+
+# HYPERPARAMETER TUNING --------------------------------------------------------
+# set up grid
+mlp_grid <- expand.grid(
+  hidden_units = c(5, 10, 20),       
+  penalty = c(0.001, 0.01, 0.1, 1),
+  epochs = c(100, 200, 500)
+)
+
+# define model
+mlp_tuned_model <- mlp(mode = "classification") %>%
+  set_engine("nnet") %>%
+  set_args(
+    hidden_units = tune(),
+    penalty = tune(),
+    epochs = tune()
+  )
+
+# build workflow
+mlp_tuned_workflow <- workflow() %>%
+  add_model(mlp_tuned_model) %>%
+  add_recipe(mlp_recipe)
+
+# perform 10-fold cross-validation for tuning
+cv_folds <- group_vfold_cv(train_data, v = 10, group = study_id, balance = "observations")
+
+# tune model
+mlp_tuned_results <- mlp_tuned_workflow %>%
+  tune_grid(
+    resamples = cv_folds,
+    grid = mlp_grid,
+    metrics = metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)  
+  )
+
+tuning_results <- collect_metrics(mlp_tuned_results)
+
+# show best performance for f1 score metric...
+best_mlp_params <- select_best(mlp_tuned_results, metric = "f_meas")
+
+mlp_tuned_results %>%
+  collect_metrics() %>%
+  filter(.config == best_mlp_params$.config)
+
+# FINAL TUNED MODEL EVALUATION -------------------------------------------------
+# finalize workflow with optimal hyperparameters
+mlp_final_workflow <- finalize_workflow(
+  mlp_tuned_workflow,
+  best_mlp_params
+)
+
+# fit the final model 
+mlp_final <- fit(mlp_final_workflow, data = train_data)
+
+# define metric set
+mlp_metrics <- metric_set(accuracy, f_meas, roc_auc, precision, recall, spec, sens)
+
+# evaluate the final model on the test set
+predictions <- mlp_final %>%
+  predict(new_data = test_data, type = "prob") %>%
+  bind_cols(mlp_final %>% predict(new_data = test_data, type = "class"), test_data)
+
+mlp_test_results <- predictions %>%
+  mlp_metrics(truth = active, estimate = .pred_class, .pred_y) 
+
+mlp_test_results
+
+# make a confusion matrix
+mlp_confusion_matrix <- predictions %>%     
+  conf_mat(truth = active, estimate = .pred_class)
+print(mlp_confusion_matrix)
+```
+
